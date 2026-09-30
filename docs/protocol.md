@@ -80,8 +80,14 @@ response. That discard has a shared fifteen-second budget plus at most one
 fifteen-second native read. Incomplete or unsupported bodies close the
 connection; status delivery is not guaranteed when a peer keeps writing.
 
-Mist owns HTTP parsing and listener supervision. A stream actor receives
-socket ownership before admitting its weft handler scope. Native socket-close
+Mist owns HTTP parsing and listener supervision. Its SSE factory registers
+before Glisten starts; Glisten's connection factory registers before the
+listener and acceptors start. An initial connection or SSE upgrade therefore
+reaches an already registered factory. Reverse shutdown stops admission
+before retiring the factories that own admitted work.
+
+A stream actor receives socket ownership before admitting its weft handler
+scope. Native socket-close
 messages initiate cancellation; the actor waits for the scope's drained
 verdict before it stops. The narrow socket adapter translates close events
 that Mist's public SSE API doesn't expose.
@@ -96,6 +102,24 @@ HTTP uses no session ids, event replay, or deprecated GET event channel.
 The native Gun shim translates maintained library calls and events; Gleam
 owns deadlines, framing, correlation, and custody. Native process identifiers
 are internal resources, not publicly forgeable transport handles.
+
+### HTTP dependencies
+
+The manifest and lock pin public forks that enforce factory registration
+before admission:
+
+| Dependency | Version | Exact Git commit |
+| --- | --- | --- |
+| [Glisten](https://github.com/Roasbeef/glisten/pull/1) | `9.0.1` | `3eb785919be0736da0a20732a56275dce0132327` |
+| [Mist](https://github.com/Roasbeef/mist/pull/3) | `6.0.3` | `28b43178ff57bfb619c64b8c3544831646d5fdb9` |
+
+Mist also retains the [framing fix](https://github.com/Roasbeef/mist/pull/2)
+that rejects ambiguous length fields before request dispatch. Glisten's
+startup ordering is tracked in
+[upstream issue #55](https://github.com/rawhat/glisten/issues/55). Dependency
+updates must preserve both factory registration order and framing refusal;
+the issue's existence does not establish that an upstream release includes
+either change.
 
 ## JSON Schema coverage
 

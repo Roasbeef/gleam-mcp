@@ -60,6 +60,13 @@ bounded byte chunks. `client_http` adopts Gun connections before sending;
 drains that scope after disconnect. Custom FFI translates maintained native
 calls and close messages; the Gleam runtime owns policy and lifetime.
 
+HTTP startup registers Mist's SSE factory before Glisten starts, and
+Glisten's connection factory before its listener and acceptors start.
+Reverse shutdown ends admission before retiring those factories. Public
+Git pins for both libraries preserve that order and Mist's framing refusal;
+[protocol contracts](docs/protocol.md#http-dependencies) record the exact
+commits and [upstream issue #55](https://github.com/rawhat/glisten/issues/55).
+
 Nothing depends on Loom core or capabilities. A tool handler owns argument
 domain validation and its external effects. Callback cancellation proves worker
 termination, not rollback of a remote effect. Raw non-text content remains

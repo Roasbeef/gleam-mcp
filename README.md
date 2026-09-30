@@ -101,6 +101,11 @@ and hostname verification. Server request bodies require unambiguous
 `Content-Length` framing and are limited to eight MiB; chunked uploads are
 refused before body collection.
 
+HTTP startup registers the connection and SSE factories before the listener
+admits work. Shutdown stops admission before retiring those factories. The
+package pins public Glisten and Mist forks for that ordering; see the
+[dependency pins and upstream issue](docs/protocol.md#http-dependencies).
+
 Requests use a single POST endpoint and accept JSON or request-scoped SSE.
 Mirrored metadata and `x-mcp-header` bindings validate before tool effects.
 Gun retries are disabled; socket loss cancels the local scope without claiming

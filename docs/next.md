@@ -1,10 +1,11 @@
 # Current handoff
 
-Audited on 2026-09-30 against protocol source baseline `c3422db` and lock `7558e23`. The
-initial published extraction baseline is `ed5758bb11939ceab4adaceda26e891172550ec1`;
-its complete Linux and macOS CI passed in run `36687863801`. The previous
-handoff's claim that initial publication was pending is superseded by that
-result. This edition records the subsequent typed protocol and bounded HTTP extension separately from that baseline.
+Audited on 2026-09-30 against source and dependency baseline
+`6db0e3a9fc2fe74bc5980517a0fc5924edb62b48`. The full local gate passed using
+the published Glisten and Mist pins. SDK publication and hosted CI for this
+baseline are pending. The prior SDK head `d829a35` passed Linux and macOS in
+[run 36713584445](https://github.com/Roasbeef/gleam-mcp/actions/runs/36713584445);
+that result does not cover the new dependency pins.
 
 ## Where the tree is
 
@@ -24,22 +25,36 @@ reported explicitly. See the corpus record for regex admission, unsupported
 vocabularies, licenses and logical work bounds. Do not infer arbitrary
 ECMAScript equivalence or native regex wall-clock bounds from that census.
 
-The complete `make check` gate passed with 232 unit tests (including all
-required schema vectors), 139 linter tests, five negative tooling checks,
-nine native stdio checks and 30 native HTTP/TLS checks. Its own exit status
-was zero. Independent Astra review found malformed argument classification,
-subscription completion admission and a false-pass regression fixture; all
-three were fixed and rechecked in the same review context. A later Linux
-consumer failure exposed unread rejected HTTP bodies; the final native gate
-now verifies status delivery, actual socket reuse, and framing refusal before
-callbacks. The existing Mist fork is pinned to `1a81d90`, whose full CI
-passed [run 36712967634](https://github.com/Roasbeef/mist/actions/runs/36712967634).
-Its parser regression fails against the original code and passes with the fix.
+The complete `make check` gate passed at `6db0e3a` with 232 unit tests
+(including all required schema vectors), 139 linter tests, five negative
+tooling checks, nine native stdio checks and 30 native HTTP/TLS checks. Its
+own exit status was zero. The gate used the public Git dependencies recorded
+in the manifest and lock; no local dependency override was needed.
+
+Glisten is pinned to `3eb785919be0736da0a20732a56275dce0132327` and Mist to
+`28b43178ff57bfb619c64b8c3544831646d5fdb9`. Both register factories before
+admitting the work those factories own. Mist's
+[startup PR #3](https://github.com/Roasbeef/mist/pull/3) retains the earlier
+framing fix and passed unit and native CI in
+[run 36764236673](https://github.com/Roasbeef/mist/actions/runs/36764236673).
+[Glisten PR #1](https://github.com/Roasbeef/glisten/pull/1) passed its inherited
+Gleam 1.14 / OTP 28 CI in
+[run 36764762464](https://github.com/Roasbeef/glisten/actions/runs/36764762464).
+The upstream report is
+[rawhat/glisten#55](https://github.com/rawhat/glisten/issues/55).
+
+Earlier review fixes for malformed argument classification, subscription
+completion admission and a false-pass regression fixture remain in the
+tree. Native HTTP checks verify status delivery, actual socket reuse, and
+framing refusal before callbacks. The Mist parser regression fails against
+the original code and passes with the framing fix. The previous handoff's
+Mist pin `1a81d90` is superseded by the startup fix above.
 
 Jevelin's four tools and separate native typed client passed at the prior
-published SDK pin. Consumer pins and their exact-head hosted results remain
-separate acceptance criteria, never implied by the SDK gate. Loom's full
-local gate and required Linux hosted gate passed at extraction head
+published SDK pin. No live Jevelin inference has been exercised. Consumer
+pins and their exact-head hosted results remain separate acceptance criteria,
+never implied by the SDK gate. Loom's full local gate and required Linux
+hosted gate passed at extraction head
 `cd932374`; its hosted macOS e2e failure also reproduces on exact base main
 `01f14ef8` at `worktree_diff_test.gleam:95`. Read consumer evidence at the
 commit and CI run that actually produced it.
@@ -63,8 +78,14 @@ back to the caller's handle consistently.
 HTTP binds loopback and requires an explicit admission policy. Present
 Origins and mirrored headers validate before effects. Gun verifies HTTPS
 peers and hostnames, disables retries and joins the actual connection owner
-before return. Mist owns parsing and supervision; the narrow close-event
-adapter exists because its public SSE interface omits socket-close delivery.
+before return.
+
+Mist's SSE factory registers before Glisten starts; Glisten's
+connection factory registers before its listener and acceptors start.
+Reverse shutdown ends admission before retiring either factory. Mist owns
+parsing and supervision; the narrow close-event adapter exists because its
+public SSE interface omits socket-close delivery.
+
 Server uploads require unambiguous `Content-Length` framing within eight MiB;
 unsupported chunked uploads close before body collection. Bounded refusal
 drains use a shared fifteen-second budget plus at most one native read;
@@ -78,10 +99,13 @@ connection with VM exit.
 
 ## What to do next
 
-1. Keep consumer dependency updates exact and reproducible. Exit: clean
+1. Publish the SDK baseline and verify its exact-head Linux and macOS CI.
+   Exit: both SDK jobs pass the published commit with the public dependency
+   pins recorded above.
+2. Keep consumer dependency updates exact and reproducible. Exit: clean
    Jevelin/Loom builds and hosted Linux/macOS checks pass the named published
    commits, including real Loom MCP and jailed code-mode exchanges.
-2. Implement resources and prompts under issue #1 as a separate body of work.
+3. Implement resources and prompts under issue #1 as a separate body of work.
    Exit: typed APIs, capability negotiation and independent exchanges prove
    the advertised behavior. See [optional features](extensions.md).
 
