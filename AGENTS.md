@@ -35,3 +35,17 @@ prose explaining why. Keep dependency locks and copied tooling separate from
 application commits. Update `docs/next.md` and these mirrored package docs
 when types, messages or dependencies change. Run one independent adversarial
 review before declaring substantive work complete.
+
+## Package boundary
+
+`gleam_mcp/json` and `corruption` own strict values and bounded decoding
+reports. `jsonrpc`, `protocol` and `stdio` own wire messages and framing.
+`client` and `transport` own client actors, pending requests and native exit
+evidence. `server` owns the immutable tool registry and initialization
+phase; `server_stdio` owns its scoped request and input workers. Native
+functions live in `internal/ffi_port` and `internal/ffi_stdio`.
+
+Nothing depends on Loom core or capabilities. A tool handler owns argument
+validation and its external effects. Callback cancellation proves worker
+termination, not rollback of a remote effect. Raw non-text content remains
+in the generic protocol value so consumers own any reduction policy.
