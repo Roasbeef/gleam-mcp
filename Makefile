@@ -33,3 +33,4 @@ tooling-test:
 
 native-test: test
 	python3 test/native_stdio_test.py
+	python3 test/native_http_test.py

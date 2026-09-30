@@ -23,6 +23,27 @@ class GateTests(unittest.TestCase):
             module.write_text('@external(erlang, "io", "write")\npub fn write() -> Nil\n')
             self.assertEqual(len(check_source(root)), 2)
 
+    def test_schema_internal_modules_cannot_hide_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "src/gleam_mcp/internal/schema/evaluate.gleam"
+            module.parent.mkdir(parents=True)
+            module.write_text("import gleam/regexp\nimport gleam_mcp/json\n")
+            self.assertEqual(check_source(root), [])
+            for dependency in ("weft", "gleam/io", "gun", "mist", "gleam_mcp/internal/ffi_native"):
+                module.write_text("import " + dependency + "\n")
+                self.assertTrue(check_source(root), dependency)
+
+    def test_typed_wire_modules_cannot_import_runtime_adapters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "src/gleam_mcp/codec.gleam"
+            module.parent.mkdir(parents=True)
+            module.write_text("import gleam_mcp/internal/schema/evaluate\n")
+            self.assertEqual(check_source(root), [])
+            module.write_text("import gleam_mcp/client_http\n")
+            self.assertTrue(check_source(root))
+
     def test_documentation_mirrors_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
