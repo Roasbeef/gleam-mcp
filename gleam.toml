@@ -1,6 +1,6 @@
 name = "gleam_mcp"
-version = "0.1.0"
-description = "A tools-only MCP client and stdio server for Gleam."
+version = "0.2.0"
+description = "A typed MCP tools client and server over stdio and HTTP."
 repository = { type = "github", user = "Roasbeef", repo = "gleam-mcp" }
 gleam = ">= 1.18.0"
 
@@ -9,6 +9,12 @@ gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 weft = "== 0.4.4"
+gleam_regexp = ">= 1.0.0 and < 2.0.0"
+gleam_http = ">= 4.0.0 and < 5.0.0"
+glisten = ">= 9.0.0 and < 10.0.0"
+gun = ">= 2.6.0 and < 3.0.0"
+mist = { git = "https://github.com/Roasbeef/mist.git", ref = "65b29375ecefc9a5d58bf4190a2eee41d7dd1db5" }
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
+simplifile = ">= 2.0.0 and < 3.0.0"
