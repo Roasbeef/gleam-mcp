@@ -22,7 +22,7 @@ packages = [
   { name = "gun", version = "2.6.0", build_tools = ["make", "rebar3"], requirements = ["cowlib"], otp_app = "gun", source = "hex", outer_checksum = "69BB957F4BD6C475B5714460FD65C26FC7EB85760AA64B74754DE36CE5CCED7D" },
   { name = "hpack_erl", version = "0.3.0", build_tools = ["rebar3"], requirements = [], otp_app = "hpack", source = "hex", outer_checksum = "D6137D7079169D8C485C6962DFE261AF5B9EF60FBC557344511C1E65E3D95FB0" },
   { name = "logging", version = "1.5.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "logging", source = "hex", outer_checksum = "BC5F18CE5DD9686100229FE5409BDC3DD5C46D5A7DF2F804AD2D8F0DD6C5060E" },
-  { name = "mist", version = "6.0.3", build_tools = ["gleam"], requirements = ["exception", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "glisten", "gramps", "hpack_erl", "logging"], source = "git", repo = "https://github.com/Roasbeef/mist.git", commit = "65b29375ecefc9a5d58bf4190a2eee41d7dd1db5" },
+  { name = "mist", version = "6.0.3", build_tools = ["gleam"], requirements = ["exception", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "glisten", "gramps", "hpack_erl", "logging"], source = "git", repo = "https://github.com/Roasbeef/mist.git", commit = "1a81d90d58deac4f95e4a996e57279bc32dfd1a0" },
   { name = "simplifile", version = "2.7.0", build_tools = ["gleam"], requirements = ["filepath", "gleam_stdlib"], otp_app = "simplifile", source = "hex", outer_checksum = "A2727627B063E87351934C7F7F008F2D1FDB16F6DE0B8C79F9E46459CFC9C164" },
   { name = "weft", version = "0.4.5", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib"], otp_app = "weft", source = "hex", outer_checksum = "CDD540819BE4E87D3C19FD4843F02AB1707A979FE909AE85EEF2034C1E48ED6C" },
 ]
@@ -36,6 +36,6 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 glisten = { version = ">= 9.0.0 and < 10.0.0" }
 gun = { version = ">= 2.6.0 and < 3.0.0" }
-mist = { git = "https://github.com/Roasbeef/mist.git", ref = "65b29375ecefc9a5d58bf4190a2eee41d7dd1db5" }
+mist = { git = "https://github.com/Roasbeef/mist.git", ref = "1a81d90d58deac4f95e4a996e57279bc32dfd1a0" }
 simplifile = { version = ">= 2.0.0 and < 3.0.0" }
 weft = { version = "== 0.4.5" }
