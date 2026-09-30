@@ -15,6 +15,27 @@ import gleam_mcp/server_http
 
 /// Boots a real listener and reports the death of each admitted callback.
 pub fn server(port: Int) {
+  server_with_admission(port, server_http.LocalUnauthenticated)
+}
+
+/// Boots the listener with a fixture-only bearer admission check.
+///
+/// ## Examples
+///
+/// `server_auth(8000)` accepts exactly the fixture token.
+pub fn server_auth(port: Int) {
+  server_with_admission(
+    port,
+    server_http.Authenticate(fn(headers) {
+      case list.key_find(headers, "authorization") {
+        Ok("Bearer fixture-token") -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }),
+  )
+}
+
+fn server_with_admission(port: Int, admission: server_http.Admission) {
   let admitted = process.new_subject()
   let assert Ok(input) =
     schema.new(
@@ -35,12 +56,7 @@ pub fn server(port: Int) {
       ]),
     )
   let assert Ok(config) =
-    server_http.new(
-      port,
-      "/mcp",
-      ["http://allowed.example"],
-      server_http.LocalUnauthenticated,
-    )
+    server_http.new(port, "/mcp", ["http://allowed.example"], admission)
   let assert Ok(_) =
     server_http.start(
       config,

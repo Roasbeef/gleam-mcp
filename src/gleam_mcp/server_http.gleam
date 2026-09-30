@@ -2,6 +2,8 @@
 //// its socket to a parked SSE actor before that actor starts a weft worker.
 //// Socket close cancels the scope, and the actor waits for its drained verdict
 //// before stopping. Header and Origin refusals happen before worker admission.
+//// Request bodies use unambiguous Content-Length framing up to eight MiB.
+//// Transfer-Encoding is refused before Mist can buffer a declared HTTP chunk.
 
 import gleam/bit_array
 import gleam/bytes_tree
@@ -9,6 +11,7 @@ import gleam/erlang/process.{type Subject}
 import gleam/http as http_types
 import gleam/http/request as http_request
 import gleam/http/response
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
@@ -27,6 +30,7 @@ import glisten/socket/options
 import glisten/transport
 import mist
 import weft
+import weft/poll
 
 /// Explicit operator admission, separate from descriptive MCP client identity.
 pub type Admission {
@@ -121,12 +125,109 @@ fn handle(
   req: http_request.Request(mist.Connection),
 ) -> response.Response(mist.ResponseData) {
   case admit(config, req) {
-    Error(status) -> plain(status, "")
+    Error(status) -> reject(config, req, status)
     Ok(Nil) ->
       case req.method, req.path {
         http_types.Post, path if path == config.path ->
           post(config, dispatch, input_schema, req)
-        _, _ -> plain(405, "") |> response.set_header("allow", "POST")
+        _, _ -> reject(config, req, 405) |> response.set_header("allow", "POST")
+      }
+  }
+}
+
+// A refusal must consume its framed body before Mist reuses the connection.
+// Otherwise a later body packet becomes a second request and closes the socket,
+// which can reset the first response on Linux. Discarding never parses JSON or
+// admits a callback, and retains only Mist's current bounded chunk.
+fn reject(config: Config, req: http_request.Request(mist.Connection), status) {
+  case discard_body(req, config.limit) {
+    Ok(Nil) -> plain(status, "")
+    Error(Nil) ->
+      plain(status, "") |> response.set_header("connection", "close")
+  }
+}
+
+fn discard_body(req: http_request.Request(mist.Connection), limit: Int) {
+  use Nil <- result.try(
+    body_framing(req.headers, limit) |> result.replace_error(Nil),
+  )
+  use consume <- result.try(mist.stream(req) |> result.replace_error(Nil))
+
+  // Mist bounds each blocking body read to fifteen seconds. The shared poll
+  // deadline charges those reads to one fifteen-second budget, so a slow peer
+  // can overrun it by at most the final read rather than restart it per chunk.
+  case
+    poll.fold_until(
+      clock: poll.monotonic(),
+      within: 15_000,
+      every: poll.Fixed(1),
+      from: #(consume, limit),
+      attempt: discard_chunk,
+    )
+  {
+    poll.Answer(Nil) -> Ok(Nil)
+    poll.Failure(Nil) | poll.RanOut(_) -> Error(Nil)
+  }
+}
+
+// Mist's chunked reader can collect a whole declared chunk before yielding.
+// Both admitted reads and refusal drains require bounded Content-Length framing.
+// Unsupported or ambiguous framing closes before trusting a chunk declaration.
+fn body_framing(headers: List(#(String, String)), limit: Int) {
+  use Nil <- result.try(
+    case
+      list.any(headers, fn(header) {
+        string.lowercase(header.0) == "transfer-encoding"
+      })
+    {
+      True -> Error("unsupported or ambiguous HTTP body framing")
+      False -> Ok(Nil)
+    },
+  )
+  let length = case http_headers.get(headers, "content-length") {
+    Ok(value) -> {
+      use Nil <- result.try(
+        case
+          value != ""
+          && list.all(string.to_graphemes(value), fn(digit) {
+            list.contains(
+              ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+              digit,
+            )
+          })
+        {
+          True -> Ok(Nil)
+          False -> Error("malformed HTTP content length")
+        },
+      )
+      int.parse(value) |> result.replace_error("malformed HTTP content length")
+    }
+    Error(_) ->
+      case
+        list.any(headers, fn(header) {
+          string.lowercase(header.0) == "content-length"
+        })
+      {
+        True -> Error("unsupported or ambiguous HTTP body framing")
+        False -> Ok(0)
+      }
+  }
+  use length <- result.try(length)
+  case length >= 0 && length <= limit {
+    True -> Ok(Nil)
+    False -> Error("HTTP request exceeds byte limit")
+  }
+}
+
+fn discard_chunk(state) {
+  let #(consume, remaining) = state
+  case consume(65_536) {
+    Error(_) -> poll.Broken(Nil)
+    Ok(mist.Done) -> poll.Settled(Nil)
+    Ok(mist.Chunk(data, next)) ->
+      case bit_array.byte_size(data) <= remaining {
+        True -> poll.Pending(#(next, remaining - bit_array.byte_size(data)))
+        False -> poll.Broken(Nil)
       }
   }
 }
@@ -161,7 +262,9 @@ fn post(
   req: http_request.Request(mist.Connection),
 ) {
   case read_body(req, config.limit) {
-    Error(reason) -> rpc_error(400, None, -32_700, reason, None)
+    Error(reason) ->
+      rpc_error(400, None, -32_700, reason, None)
+      |> response.set_header("connection", "close")
     Ok(body) ->
       case json.parse(body) {
         Error(_) -> rpc_error(400, None, -32_700, "parse error", None)
@@ -273,7 +376,8 @@ fn custom_headers(
   }
 }
 
-fn read_body(req, limit) {
+fn read_body(req: http_request.Request(mist.Connection), limit: Int) {
+  use Nil <- result.try(body_framing(req.headers, limit))
   use consume <- result.try(
     mist.stream(req) |> result.map_error(fn(_) { "malformed HTTP body" }),
   )

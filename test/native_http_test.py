@@ -24,7 +24,7 @@ META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
 
 def command(expression):
     return ["erl", "-noshell", "-pa", *LIBS, "-eval",
-            "application:ensure_all_started(gleam_mcp), " + expression]
+            "logger:set_primary_config(level, emergency), application:ensure_all_started(gleam_mcp), " + expression]
 
 
 def envelope(method="tools/list", mode=None):
@@ -223,6 +223,99 @@ class NativeRegistry(unittest.TestCase):
         response.close()
         connection.close()
 
+
+class NativeAdmissionHttp(unittest.TestCase):
+    fixture_name = "server_auth"
+    setUp = NativeHttp.setUp
+    tearDown = NativeHttp.tearDown
+
+    def test_unbounded_rejected_framing_closes_without_waiting_for_body(self):
+        for framing in ({"Content-Length": str(9 * 1024 * 1024)},
+                        {"Transfer-Encoding": "chunked"}):
+            with self.subTest(framing=framing):
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+                try:
+                    connection.putrequest("POST", "/mcp")
+                    for name, value in framing.items():
+                        connection.putheader(name, value)
+                    connection.endheaders()
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 401)
+                    self.assertEqual(response.getheader("Connection"), "close")
+                    self.assertEqual(response.read(), b"")
+                finally:
+                    connection.close()
+        self.assertFalse(select.select([self.child.stdout], [], [], 0.1)[0],
+                         "unsupported rejection framing admitted a callback")
+
+    def test_admitted_unbounded_or_ambiguous_framing_is_refused_before_read(self):
+        for framing in (("Content-Length", str(9 * 1024 * 1024)),
+                        ("Transfer-Encoding", "chunked"),
+                        ("Content-Length", "invalid"),
+                        ("Content-Length", "duplicate")):
+            with self.subTest(framing=framing):
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+                try:
+                    connection.putrequest("POST", "/mcp")
+                    connection.putheader("Authorization", "Bearer fixture-token")
+                    if framing[1] == "duplicate":
+                        connection.putheader("Content-Length", "10")
+                        connection.putheader("Content-Length", "11")
+                    else:
+                        connection.putheader(*framing)
+                    connection.endheaders()
+                    if framing[1] == "duplicate":
+                        # Mist refuses the repeated wire field before SDK admission.
+                        # A timeout is a failure: no body is needed to detect it.
+                        with self.assertRaises((http.client.RemoteDisconnected, ConnectionResetError)):
+                            connection.getresponse()
+                    else:
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 400)
+                        self.assertEqual(response.getheader("Connection"), "close")
+                        self.assertEqual(json.loads(response.read())["error"]["code"], -32700)
+                finally:
+                    connection.close()
+        self.assertFalse(select.select([self.child.stdout], [], [], 0.1)[0],
+                         "invalid admitted framing dispatched a callback")
+
+    def test_rejected_bodies_are_discarded_before_keepalive_reuse(self):
+        # Separate header/body writes reproduce Linux's unread-body reset path.
+        body = b"untrusted request body" * 8192
+        cases = [(None, None, "POST", 401),
+                 ("Bearer wrong-token", None, "POST", 401),
+                 ("Bearer fixture-token", "http://evil.example", "POST", 403),
+                 ("Bearer fixture-token", None, "GET", 405)]
+        for auth, origin, method, status in cases:
+            with self.subTest(status=status, auth=auth):
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                try:
+                    connection.putrequest(method, "/mcp")
+                    connection.putheader("Content-Length", str(len(body)))
+                    if auth:
+                        connection.putheader("Authorization", auth)
+                    if origin:
+                        connection.putheader("Origin", origin)
+                    connection.endheaders()
+                    connection.send(body)
+                    original_socket = connection.sock
+                    self.assertIsNotNone(original_socket)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, status)
+                    self.assertEqual(response.read(), b"")
+                    self.assertFalse(select.select([self.child.stdout], [], [], 0.1)[0],
+                                     "a refused request admitted a callback")
+
+                    # A second refusal must retain framing on the same socket.
+                    connection.request("POST", "/mcp", b"next body")
+                    self.assertIs(connection.sock, original_socket, "the second refusal silently reconnected")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 401)
+                    self.assertEqual(response.read(), b"")
+                finally:
+                    connection.close()
+        self.assertFalse(select.select([self.child.stdout], [], [], 0.1)[0],
+                         "discarding an unauthorized body admitted a callback")
 
 class PythonPeer(unittest.TestCase):
     def client(self, mode, timeout=2000, fixture="client"):
