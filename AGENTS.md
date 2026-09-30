@@ -40,12 +40,27 @@ review before declaring substantive work complete.
 
 `gleam_mcp/json` and `corruption` own strict values and bounded decoding
 reports. `jsonrpc`, `protocol` and `stdio` own wire messages and framing.
-`client` and `transport` own client actors, pending requests and native exit
-evidence. `server` owns the immutable tool registry and initialization
-phase; `server_stdio` owns its scoped request and input workers. Native
-functions live in `internal/ffi_port` and `internal/ffi_stdio`.
+`schema.Schema` compiles Draft 2020-12 assertions and offline resources;
+`codec.Codec(a)` validates custom encoding and decoding against that schema.
+`tool.Tool(args, output)` couples both codecs to a validated name and a
+request-bound result decoder. `server.bind` admits a typed handler through
+that same definition. Internal schema modules remain inside the pure gate.
+
+`metadata`, `version`, `discovery`, `mrtr`, and `subscription` own the modern
+request contracts. `request.Endpoint` binds a caller-owned exchange and
+schema admission. `client.Continuation(output)` preserves the original
+endpoint, arguments, output codec, and opaque state across explicit resumes.
+`client` and `transport` own native client actors, pending request correlation,
+and process-exit evidence. `server` owns the immutable tool registry and
+profile dispatch; `server_stdio` owns scoped readers, writers, and handlers.
+
+`http` and `http_headers` admit mirrored metadata before effects; `sse` frames
+bounded byte chunks. `client_http` adopts Gun connections before sending;
+`server_http` transfers Mist sockets before admitting a handler scope and
+drains that scope after disconnect. Custom FFI translates maintained native
+calls and close messages; the Gleam runtime owns policy and lifetime.
 
 Nothing depends on Loom core or capabilities. A tool handler owns argument
-validation and its external effects. Callback cancellation proves worker
+domain validation and its external effects. Callback cancellation proves worker
 termination, not rollback of a remote effect. Raw non-text content remains
 in the generic protocol value so consumers own any reduction policy.

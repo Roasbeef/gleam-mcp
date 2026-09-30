@@ -1,50 +1,76 @@
 # Current handoff
 
-Audited on 2026-09-30 against application and lock baseline `acb4d70`.
-The implementation comes from Loom `f399a07cf`; this handoff records the
-standalone extraction, rather than carrying the previous in-progress stub.
+Audited on 2026-09-30 against protocol source baseline `fdc4fbf` and lock `b918f7a`. The
+initial published extraction baseline is `ed5758bb11939ceab4adaceda26e891172550ec1`;
+its complete Linux and macOS CI passed in run `36687863801`. The previous
+handoff's claim that initial publication was pending is superseded by that
+result. This edition records the completed local protocol extension separately from that baseline.
 
 ## Where the tree is
 
-The package exposes strict JSON and JSON-RPC decoding, MCP framing,
-client actors and transports, an immutable tools registry, and a foreground
-stdio server. It supports `2025-06-18` and `2024-11-05`. The client has no
-Loom dependency; callers choose identity, isolation and result reduction.
-Loom keeps its generator, schema planner and MessagePack adapter.
+The modern profile follows released MCP `2026-07-28`, pinned to official
+specification commit `046fa30efd374370afb87ef830bd788eac5f217e` after initial
+publication. Typed definitions couple schemas, encoders and decoders for
+both client and server. Stdio and HTTP use the required request/response,
+explicit multi-round-trip and subscription envelopes. The initialized
+`2025-06-18` and `2024-11-05` stdio profiles remain available to Loom.
+Resources and prompts are tracked in [issue #1](https://github.com/Roasbeef/gleam-mcp/issues/1);
+optional providers, tasks and OAuth flows remain unadvertised.
 
-`make check` passed with 183 Gleam tests, 139 copied-linter tests, three
-negative tooling tests and six native pipe/frame-reader tests. The native
-client connects to an actual server process. Independent review found a
-nested request-custody race and an incomplete test-frame deadline; both
-were corrected and rechecked. The synchronized liveness assertions pass,
-but restoring the old custody code did not fail under the ordinary
-scheduler, so that mutation is not evidence against the old race.
-Hosted CI has not yet completed for the initial publication.
+The schema gate includes all 1,301 required Draft 2020-12 vectors at the
+recorded upstream revision, with zero skips. The optional corpus measures
+546/1,036 passing vectors; the remaining 490 refusals or mismatches are
+reported explicitly. See the corpus record for regex admission, unsupported
+vocabularies, licenses and logical work bounds. Do not infer arbitrary
+ECMAScript equivalence or native regex wall-clock bounds from that census.
+
+The complete `make check` gate passed with 232 unit tests (including all
+required schema vectors), 139 linter tests, five negative tooling checks,
+nine native stdio checks and 27 native HTTP/TLS checks. Its own exit status
+was zero. Independent Astra review found malformed argument classification,
+subscription completion admission and a false-pass regression fixture; all
+three were fixed and rechecked in the same review context. Jevelin's four
+tools and a separate native typed client also passed against a private SDK
+snapshot. Published consumer pins and their exact-head hosted results are
+separate acceptance criteria, never implied by this local gate.
 
 ## Rulings already made
 
-The callback stays parked until its scope is adopted by the outer managed
-task. Input failure must join that owner before return. EOF stops admission
-and drains admitted work under the original request deadline. These
-contracts live in `server_stdio` and its tests. Worker exit proves local
-termination, not rollback of a remote effect.
+A typed codec checks custom encoders as well as decoders. Request-bound
+result decoding closes over the original arguments. An opaque continuation
+retains those arguments, the exact endpoint, revision and result decoder;
+resumption is a new explicit attempt. Untrusted server continuation state
+still needs application integrity validation when it represents authority.
+Transport failure never triggers automatic effect replay.
 
-The strict JSON parser preserves integer precision, rejects duplicate keys
-and validates Unicode. Non-text content keeps its original JSON in
-`protocol.Other`; consumers own any reduction.
+The stdio reader, writer and admitted handlers have explicit custody. A
+callback stays parked until its scope is adopted. EOF stops admission and
+drains admitted work under its original deadline. Worker retirement proves
+local termination, not rollback of a remote effect. A live subscription
+must coexist with ordinary requests and map its allocated wire identifier
+back to the caller's handle consistently.
+
+HTTP binds loopback and requires an explicit admission policy. Present
+Origins and mirrored headers validate before effects. Gun verifies HTTPS
+peers and hostnames, disables retries and joins the actual connection owner
+before return. Mist owns parsing and supervision; the narrow close-event
+adapter exists because its public SSE interface omits socket-close delivery.
+
+The initial custody regression has positive synchronized liveness witnesses,
+but restoring the old custody code passed under the ordinary scheduler.
+That mutation does not prove the old race was detected. Independent native
+HTTP tests keep the client VM alive after return to avoid masking a leaked
+connection with VM exit.
 
 ## What to do next
 
-1. After both consumer repositories and the Loom extraction PR are published,
-   pin the latest official MCP specification and implement its required
-   protocol plus HTTP transport. Exit: exact revision documented and
-   independent peer/failure-path tests pass.
-2. Couple tool schemas, argument encoders/decoders and result decoding through
-   opaque typed definitions shared by client and server. Exit: ordinary
-   typed callers cannot pass arguments for a different tool or decoder.
-3. Verify published Git dependencies from clean consumer checkouts and record
-   the exact hosted CI results. Exit: no local path dependency is required.
+1. Keep consumer dependency updates exact and reproducible. Exit: clean
+   Jevelin/Loom builds and hosted Linux/macOS checks pass the named published
+   commits, including real Loom MCP and jailed code-mode exchanges.
+2. Implement resources and prompts under issue #1 as a separate body of work.
+   Exit: typed APIs, capability negotiation and independent exchanges prove
+   the advertised behavior. See [optional features](extensions.md).
 
-Optional capabilities remain unadvertised until their behavior exists.
-Run `make check`; see [execution](execution.md) for verification hazards and
-[the inherited style guide](gleam-style.md) before editing source.
+Run `make check`; [execution](execution.md) explains verification hazards,
+and [protocol contracts](protocol.md) record the current wire and ownership
+boundaries. The inherited style guide and custom linter remain the gates.
