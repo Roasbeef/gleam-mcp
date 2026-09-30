@@ -2,10 +2,11 @@
 
 Audited on 2026-09-30 against source and dependency baseline
 `6db0e3a9fc2fe74bc5980517a0fc5924edb62b48`. The full local gate passed using
-the published Glisten and Mist pins. SDK publication and hosted CI for this
-baseline are pending. The prior SDK head `d829a35` passed Linux and macOS in
-[run 36713584445](https://github.com/Roasbeef/gleam-mcp/actions/runs/36713584445);
-that result does not cover the new dependency pins.
+the published Glisten and Mist pins. Runtime publication `686955fc` passed
+Linux and macOS CI in
+[run 36765278006](https://github.com/Roasbeef/gleam-mcp/actions/runs/36765278006).
+A fresh public Linux clone of that commit also passed the complete gate
+without local dependency overrides.
 
 ## Where the tree is
 
@@ -40,7 +41,8 @@ framing fix and passed unit and native CI in
 [Glisten PR #1](https://github.com/Roasbeef/glisten/pull/1) passed its inherited
 Gleam 1.14 / OTP 28 CI in
 [run 36764762464](https://github.com/Roasbeef/glisten/actions/runs/36764762464).
-The upstream report is
+It was merged into the fork's `compat/v9.0.1` branch as `1e53a4d`; the SDK
+retains the exact tested commit above. The upstream report is
 [rawhat/glisten#55](https://github.com/rawhat/glisten/issues/55).
 
 Earlier review fixes for malformed argument classification, subscription
@@ -50,14 +52,18 @@ framing refusal before callbacks. The Mist parser regression fails against
 the original code and passes with the framing fix. The previous handoff's
 Mist pin `1a81d90` is superseded by the startup fix above.
 
-Jevelin's four tools and separate native typed client passed at the prior
-published SDK pin. No live Jevelin inference has been exercised. Consumer
-pins and their exact-head hosted results remain separate acceptance criteria,
-never implied by the SDK gate. Loom's full local gate and required Linux
-hosted gate passed at extraction head
-`cd932374`; its hosted macOS e2e failure also reproduces on exact base main
-`01f14ef8` at `worktree_diff_test.gleam:95`. Read consumer evidence at the
-commit and CI run that actually produced it.
+Jevelin MCP publication `fb5b434` consumes SDK `686955fc` and passed Linux
+and macOS in [run 36766066616](https://github.com/Roasbeef/jevelin-mcp/actions/runs/36766066616).
+Its fresh public Linux clone passed the full gate and fifty unchanged HTTP
+startup suites, including 150 expected authentication refusals. No live
+Jevelin inference has been exercised.
+
+Loom extraction `6de0188` pins the same SDK. Its full local gate passed at
+source/dependency baseline `7b8cd39f9`; final hosted and jailed checks remain
+separate. The preceding `589a2cd` passed the required Linux gate and advisory
+macOS package check, while macOS e2e still failed at `worktree_diff_test.gleam:95`.
+That assertion and GitFailed(128) diagnostic also fail on exact base main
+`01f14ef8`. Read consumer evidence at the commit and CI run that produced it.
 
 ## Rulings already made
 
@@ -99,13 +105,10 @@ connection with VM exit.
 
 ## What to do next
 
-1. Publish the SDK baseline and verify its exact-head Linux and macOS CI.
-   Exit: both SDK jobs pass the published commit with the public dependency
-   pins recorded above.
-2. Keep consumer dependency updates exact and reproducible. Exit: clean
+1. Keep consumer dependency updates exact and reproducible. Exit: clean
    Jevelin/Loom builds and hosted Linux/macOS checks pass the named published
    commits, including real Loom MCP and jailed code-mode exchanges.
-3. Implement resources and prompts under issue #1 as a separate body of work.
+2. Implement resources and prompts under issue #1 as a separate body of work.
    Exit: typed APIs, capability negotiation and independent exchanges prove
    the advertised behavior. See [optional features](extensions.md).
 
