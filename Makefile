@@ -1,6 +1,6 @@
-.PHONY: check fmt fmt-check build test lint lint-test doc-check source-check
+.PHONY: check fmt fmt-check build test lint lint-test doc-check source-check tooling-test native-test
 
-check: fmt-check build test lint-test lint source-check doc-check tooling-test
+check: fmt-check build test lint-test lint source-check doc-check tooling-test native-test
 
 fmt:
 	gleam format
@@ -30,3 +30,6 @@ doc-check:
 
 tooling-test:
 	python3 scripts/test_gates.py
+
+native-test: test
+	python3 test/native_stdio_test.py
