@@ -1,0 +1,7 @@
+/build/
+/packages/*/build/
+*.beam
+*.ez
+erl_crash.dump
+__pycache__/
+.env
