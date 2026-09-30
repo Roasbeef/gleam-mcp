@@ -60,12 +60,23 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
+import gleam_mcp/codec
 import gleam_mcp/corruption
+import gleam_mcp/discovery
+import gleam_mcp/internal/ffi_request
 import gleam_mcp/json.{type JsonValue}
 import gleam_mcp/jsonrpc.{type Id}
+import gleam_mcp/metadata
+import gleam_mcp/mrtr
 import gleam_mcp/protocol.{type CallToolResult, type ToolDescriptor}
+import gleam_mcp/request as requests
+import gleam_mcp/schema
 import gleam_mcp/stdio
+import gleam_mcp/subscription
+import gleam_mcp/tool as definition
 import gleam_mcp/transport.{type Transport}
+import gleam_mcp/version
+import weft
 import weft/poll
 import weft/state_machine as sm
 
@@ -261,6 +272,15 @@ pub opaque type Msg {
     reply: Subject(Result(JsonValue, ClientError)),
   )
 
+  /// A modern request retains its exact envelope correlation and observer.
+  RawRequest(outbound: requests.Outbound, reply: Subject(RawEvent))
+
+  /// The owner of a modern request disappeared before its response settled.
+  RawCallerGone(monitor: process.Monitor)
+
+  /// Explicit cancellation identifies the caller's original request id.
+  CancelRaw(id: Id)
+
   /// One outbound notification, fire-and-forget.
   Notify(message: JsonValue)
 
@@ -277,7 +297,22 @@ pub opaque type Msg {
 }
 
 type InFlight {
-  InFlight(reply: Subject(Result(JsonValue, ClientError)), deadline_ms: Int)
+  InFlight(reply: Reply, deadline_ms: Int)
+}
+
+type Reply {
+  LegacyReply(Subject(Result(JsonValue, ClientError)))
+  ModernReply(
+    original_id: Id,
+    reply: Subject(RawEvent),
+    monitor: process.Monitor,
+    stream: Option(subscription.Stream),
+  )
+}
+
+type RawEvent {
+  RawNotification(JsonValue)
+  RawResult(Result(JsonValue, requests.Error))
 }
 
 type State {
@@ -668,6 +703,12 @@ fn start_actor(
     let base =
       process.new_selector()
       |> process.select(commands)
+      |> process.select_monitors(fn(down) {
+        case down {
+          process.ProcessDown(monitor, _, _)
+          | process.PortDown(monitor, _, _) -> RawCallerGone(monitor)
+        }
+      })
       |> process.select_map(inbound, FromTransport)
       |> process.select_specific_monitor(process.monitor(preparer), fn(_) {
         PreparerGone
@@ -740,8 +781,19 @@ fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
       process.send(reply, Error(Unavailable("mcp client has not opened")))
       sm.keep(state)
     }
-    Prepared, Notify(_) | Prepared, FromTransport(_) | Prepared, Expire(_) ->
+    Prepared, RawRequest(reply:, ..) -> {
+      process.send(
+        reply,
+        RawResult(Error(requests.TransportFailed("mcp client has not opened"))),
+      )
       sm.keep(state)
+    }
+    Prepared, Notify(_)
+    | Prepared, FromTransport(_)
+    | Prepared, Expire(_)
+    | Prepared, RawCallerGone(_)
+    | Prepared, CancelRaw(_)
+    -> sm.keep(state)
     Serving, other | Closing, other | Retired(_), other ->
       handle_opened(state, other)
   }
@@ -782,6 +834,21 @@ fn handle_opened(state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
   case msg {
     Request(build:, deadline_ms:, reply:) ->
       handle_request(state, build, deadline_ms, reply)
+    RawRequest(outbound, reply) -> handle_raw_request(state, outbound, reply)
+    RawCallerGone(monitor) ->
+      cancel_matching(state, fn(reply) {
+        case reply {
+          ModernReply(monitor: found, ..) -> found == monitor
+          LegacyReply(_) -> False
+        }
+      })
+    CancelRaw(id) ->
+      cancel_matching(state, fn(reply) {
+        case reply {
+          ModernReply(original_id: found, ..) -> found == id
+          LegacyReply(_) -> False
+        }
+      })
     Notify(message:) -> handle_notify(state, message)
     FromTransport(transport.TransportData(bytes:)) -> handle_data(state, bytes)
     FromTransport(transport.TransportClosed(reason:)) ->
@@ -810,7 +877,11 @@ fn handle_request(
       let id = state.next_id
       let message = build(jsonrpc.IdInt(id))
       let inflight =
-        dict.insert(state.inflight, id, InFlight(reply:, deadline_ms:))
+        dict.insert(
+          state.inflight,
+          id,
+          InFlight(reply: LegacyReply(reply), deadline_ms:),
+        )
       let state = State(..state, next_id: id + 1, inflight:)
       case state.connection.send(stdio.frame(message)) {
         Ok(Nil) -> {
@@ -897,7 +968,8 @@ fn handle_expire(state: State, id: Int) -> sm.Next(Phase, State, Msg) {
     // stale and the expiry means nothing.
     Error(Nil) -> sm.keep(state)
     Ok(call) -> {
-      process.send(call.reply, Error(CallTimedOut(after_ms: call.deadline_ms)))
+      settle_failure(call.reply, CallTimedOut(after_ms: call.deadline_ms))
+      cancel_modern_wire(state, id, call.reply)
       sm.keep(State(..state, inflight: dict.delete(state.inflight, id)))
     }
   }
@@ -917,18 +989,22 @@ fn feed_lines(state: State, lines: List(String)) -> sm.Next(Phase, State, Msg) {
 // One complete line. `Error(reason)` is channel-fatal; everything the
 // client merely does not act on settles as `Ok` with the line dropped.
 fn handle_line(state: State, line: String) -> Result(State, String) {
-  case jsonrpc.decode(line) {
+  case jsonrpc.decode_modern(line) {
     Error(jsonrpc.MalformedMessage(report:)) ->
       Error("mcp server sent a malformed line: " <> corruption.describe(report))
     Error(jsonrpc.BadMessage(reason:)) ->
       Error("mcp server sent a line that is not json-rpc: wanted " <> reason)
-    Ok(jsonrpc.Response(id:, outcome:)) ->
+    Ok(jsonrpc.Correlated(jsonrpc.Response(id:, outcome:))) ->
       Ok(settle_response(state, id, outcome))
-    Ok(jsonrpc.ServerRequest(id:, ..)) -> refuse_server_request(state, id)
+    Ok(jsonrpc.Correlated(jsonrpc.ServerRequest(id:, ..))) ->
+      refuse_server_request(state, id)
+    Ok(jsonrpc.UncorrelatedError(_)) -> Ok(state)
 
     // v1 subscribes to nothing, so every notification is decoded (so
     // nothing hostile hides in one) and dropped.
-    Ok(jsonrpc.Notification(..)) -> Ok(state)
+    Ok(jsonrpc.Correlated(jsonrpc.Notification(method, params))) -> {
+      route_notification(state, method, params)
+    }
   }
 }
 
@@ -946,7 +1022,7 @@ fn settle_response(
       case dict.get(state.inflight, id) {
         Error(Nil) -> state
         Ok(call) -> {
-          process.send(call.reply, outcome_to_result(outcome))
+          settle_answer(call.reply, validate_stream_result(call.reply, outcome))
           State(..state, inflight: dict.delete(state.inflight, id))
         }
       }
@@ -1008,10 +1084,1015 @@ fn die(state: State, reason: String) -> State {
     None -> {
       list.each(dict.to_list(state.inflight), fn(entry) {
         let InFlight(reply:, ..) = entry.1
-        process.send(reply, Error(Unavailable(reason:)))
+        settle_failure(reply, Unavailable(reason:))
       })
       state.connection.close()
       State(..state, inflight: dict.new(), dead: Some(reason))
     }
+  }
+}
+
+/// The typed outcome of one explicit tools/call exchange.
+pub type CallOutcome(output) {
+  /// The original definition decoded successful structured output.
+  Complete(output: output)
+
+  /// The tool returned a visible failure without satisfying its output schema.
+  ToolFailed(result: protocol.CallToolResult)
+
+  /// The request paused; only this continuation can resume its original call.
+  InputRequired(continuation: Continuation(output))
+}
+
+/// An endpoint, arguments, decoder and opaque state retained as one value.
+pub opaque type Continuation(output) {
+  Continuation(
+    endpoint: requests.Endpoint,
+    name: String,
+    arguments: JsonValue,
+    input_schema: schema.Schema,
+    decoder: codec.Codec(output),
+    revision: version.Version,
+    required: mrtr.Required,
+  )
+}
+
+/// Calls a tool through its definition without accepting raw args or a decoder.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.call(endpoint, definition, typed_args, request.options("agent", "1"))
+/// ```
+pub fn call(
+  endpoint: requests.Endpoint,
+  definition: definition.Tool(args, output),
+  args: args,
+  options: requests.Options,
+) -> Result(CallOutcome(output), requests.Error) {
+  use Nil <- result.try(admit_profile(
+    definition.output_schema(definition),
+    options,
+  ))
+  let input_schema = definition.input_schema(definition)
+  use Nil <- result.try(requests.admit_schema(endpoint, input_schema))
+  use arguments <- result.try(
+    definition.encode_arguments(definition, args)
+    |> result.map_error(requests.InvalidArguments),
+  )
+  perform_call(
+    endpoint,
+    definition.name(definition),
+    arguments,
+    input_schema,
+    definition.result_codec(definition, args),
+    None,
+    options,
+  )
+}
+
+/// Returns the suspension that supplies exact response keys and opaque state.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // mrtr.responses(client.continuation_required(continuation), explicit_inputs)
+/// ```
+pub fn continuation_required(
+  continuation: Continuation(output),
+) -> mrtr.Required {
+  continuation.required
+}
+
+/// Resumes the retained call explicitly, without changing endpoint or args.
+///
+/// It never replays an effect automatically. The caller owns provider work and
+/// must supply the exact input response keys requested by this continuation.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.resume(continuation, validated_responses, options)
+/// ```
+pub fn resume(
+  continuation: Continuation(output),
+  responses: mrtr.Responses,
+  options: requests.Options,
+) -> Result(CallOutcome(output), requests.Error) {
+  use Nil <- result.try(
+    case
+      metadata.revision(requests.metadata(options)) == continuation.revision
+    {
+      True -> Ok(Nil)
+      False ->
+        Error(requests.InvalidArguments(
+          "continuation protocol version cannot change",
+        ))
+    },
+  )
+  let pairs = case mrtr.responses_value(responses) {
+    json.Object(pairs) -> pairs
+    _ -> []
+  }
+  use _ <- result.try(
+    mrtr.responses(continuation.required, pairs)
+    |> result.map_error(requests.InvalidArguments),
+  )
+  perform_call(
+    continuation.endpoint,
+    continuation.name,
+    continuation.arguments,
+    continuation.input_schema,
+    continuation.decoder,
+    Some(#(continuation.required, responses)),
+    options,
+  )
+}
+
+fn perform_call(
+  endpoint: requests.Endpoint,
+  name: String,
+  arguments: JsonValue,
+  input_schema: schema.Schema,
+  decoder: codec.Codec(output),
+  resume: Option(#(mrtr.Required, mrtr.Responses)),
+  options: requests.Options,
+) -> Result(CallOutcome(output), requests.Error) {
+  let params = [#("name", json.String(name)), #("arguments", arguments)]
+  let params = case resume {
+    None -> params
+    Some(#(required, responses)) -> {
+      let params =
+        list.append(params, [
+          #("inputResponses", mrtr.responses_value(responses)),
+        ])
+      case mrtr.request_state(required) {
+        None -> params
+        Some(state) ->
+          list.append(params, [#("requestState", json.String(state))])
+      }
+    }
+  }
+  let revision = metadata.revision(requests.metadata(options))
+  use value <- result.try(send_request(
+    endpoint,
+    "tools/call",
+    params,
+    Some(input_schema),
+    options,
+  ))
+  use result_type <- result.try(decode_result_type(value, revision))
+  case result_type {
+    "input_required" -> {
+      use required <- result.try(
+        mrtr.decode(value) |> result.map_error(requests.InvalidResponse),
+      )
+      Ok(
+        InputRequired(Continuation(
+          endpoint,
+          name,
+          arguments,
+          input_schema,
+          decoder,
+          revision,
+          required,
+        )),
+      )
+    }
+    "complete" -> {
+      use result <- result.try(
+        protocol.decode_call_tool_result(value)
+        |> result.map_error(fn(error) {
+          requests.InvalidResponse(protocol_fault(error))
+        }),
+      )
+      case result.is_error {
+        True -> Ok(ToolFailed(result))
+        False -> {
+          use structured <- result.try(case result.structured_content {
+            Some(value) -> Ok(value)
+            None ->
+              Error(requests.InvalidResponse(
+                "typed tool result is missing structuredContent",
+              ))
+          })
+          codec.decode(decoder, structured)
+          |> result.map(Complete)
+          |> result.map_error(requests.InvalidResponse)
+        }
+      }
+    }
+    other -> Error(requests.InvalidResponse("unsupported resultType " <> other))
+  }
+}
+
+/// Discovers modern server behavior without initializing a session.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.discover(endpoint, options) preserves cache freshness and scope.
+/// ```
+pub fn discover(
+  endpoint: requests.Endpoint,
+  options: requests.Options,
+) -> Result(discovery.Discovery, requests.Error) {
+  use value <- result.try(send_request(
+    endpoint,
+    "server/discover",
+    [],
+    None,
+    options,
+  ))
+  discovery.decode(value) |> result.map_error(requests.InvalidResponse)
+}
+
+/// Builds an explicit subscription request for a transport-owned listen handle.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.listen_outbound(options, subscription.tools()) |> client_http.listen(config)
+/// ```
+pub fn listen_outbound(
+  options: requests.Options,
+  filter: subscription.Filter,
+) -> requests.Outbound {
+  listen_with_id(options, filter, jsonrpc.IdInt(ffi_request.next_id()))
+}
+
+fn listen_with_id(
+  options: requests.Options,
+  filter: subscription.Filter,
+  id: Id,
+) -> requests.Outbound {
+  requests.outbound(
+    options,
+    jsonrpc.request(
+      id,
+      "subscriptions/listen",
+      Some(
+        json.Object([
+          #("_meta", metadata.value(requests.metadata(options))),
+          #("notifications", subscription.value(filter)),
+        ]),
+      ),
+    ),
+    None,
+  )
+}
+
+fn send_request(
+  endpoint: requests.Endpoint,
+  method: String,
+  params: List(#(String, JsonValue)),
+  input_schema: Option(schema.Schema),
+  options: requests.Options,
+) -> Result(JsonValue, requests.Error) {
+  let id = jsonrpc.IdInt(ffi_request.next_id())
+  let params = case
+    version.is_modern(metadata.revision(requests.metadata(options)))
+  {
+    True -> [#("_meta", metadata.value(requests.metadata(options))), ..params]
+    False -> params
+  }
+  let message = jsonrpc.request(id, method, Some(json.Object(params)))
+  use response <- result.try(requests.exchange(
+    endpoint,
+    requests.outbound(options, message, input_schema),
+  ))
+  use inbound <- result.try(
+    jsonrpc.decode_value(response)
+    |> result.map_error(fn(_) {
+      requests.InvalidResponse("invalid JSON-RPC response envelope")
+    }),
+  )
+  case inbound {
+    jsonrpc.Correlated(jsonrpc.Response(found, outcome)) if found == id ->
+      outcome |> result.map_error(requests.RpcFailed)
+    jsonrpc.UncorrelatedError(error) -> Error(requests.RpcFailed(error))
+    jsonrpc.Correlated(_) ->
+      Error(requests.InvalidResponse("response id does not match this request"))
+  }
+}
+
+fn decode_result_type(
+  value: JsonValue,
+  revision: version.Version,
+) -> Result(String, requests.Error) {
+  case value {
+    json.Object(fields) ->
+      case list.key_find(fields, "resultType") {
+        Ok(json.String(value)) -> Ok(value)
+        Error(Nil) ->
+          case version.is_modern(revision) {
+            True ->
+              Error(requests.InvalidResponse("modern resultType is required"))
+            False -> Ok("complete")
+          }
+        _ -> Error(requests.InvalidResponse("resultType must be a string"))
+      }
+    _ -> Error(requests.InvalidResponse("result must be an object"))
+  }
+}
+
+fn protocol_fault(error: protocol.ProtocolFault) -> String {
+  case error {
+    protocol.BadResult(reason) -> reason
+    protocol.UnsupportedVersion(server, _) ->
+      "unsupported protocol version " <> server
+  }
+}
+
+/// Opens a published stdio client without initialization or ping traffic.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.prepare_owned(transport, custodian) |> result.then(client.connect_modern)
+/// ```
+@internal
+pub fn connect_modern(client: Client) -> Result(Nil, StartError) {
+  exchange(client.subject, init_timeout_ms, Open)
+  |> result.map_error(HandshakeFailed)
+  |> result.flatten
+}
+
+/// Starts the native request-oriented client while retaining retirement custody.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.start_modern(transport.PortTransport(spawn)) sends no initialize.
+/// ```
+pub fn start_modern(transport: Transport) -> Result(Client, StartError) {
+  use client <- result.try(prepare(transport))
+  case connect_modern(client) {
+    Ok(Nil) -> Ok(client)
+    Error(error) ->
+      case shutdown(client, within: init_timeout_ms) {
+        Ok(Nil) -> Error(error)
+        Error(_) -> Error(CleanupUnconfirmed(client))
+      }
+  }
+}
+
+/// Adapts the native client actor to the shared typed request interface.
+///
+/// Each callback result remains correlated to its original envelope, while the
+/// actor allocates independent wire ids for concurrent callers on one pipe.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.call(client.endpoint(native_client), definition, args, options)
+/// ```
+pub fn endpoint(client: Client) -> requests.Endpoint {
+  requests.endpoint("stdio", fn(outbound) { raw_exchange(client, outbound) })
+}
+
+/// Cancels an explicit outbound request identified by its original wire id.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.cancel(native_client, listen_request_id)
+/// ```
+pub fn cancel(client: Client, id: Id) -> Nil {
+  process.send(client.subject, CancelRaw(id))
+}
+
+fn raw_exchange(
+  client: Client,
+  outbound: requests.Outbound,
+) -> Result(JsonValue, requests.Error) {
+  use owner <- result.try(
+    process.subject_owner(client.subject)
+    |> result.replace_error(requests.TransportFailed(
+      "mcp client is not running",
+    )),
+  )
+  let reply = process.new_subject()
+  let monitor = process.monitor(owner)
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, Ok)
+    |> process.select_specific_monitor(monitor, fn(_) {
+      Error(requests.TransportFailed("mcp client stopped"))
+    })
+  process.send(client.subject, RawRequest(outbound, reply))
+  let answer = receive_raw(selector, outbound)
+  process.demonitor_process(monitor)
+  answer
+}
+
+fn receive_raw(
+  selector: process.Selector(Result(RawEvent, requests.Error)),
+  outbound: requests.Outbound,
+) -> Result(JsonValue, requests.Error) {
+  let clock = poll.monotonic()
+  let budget = outbound.timeout_ms + reply_margin_ms
+  let deadline = clock.now() + budget
+  case
+    poll.fold_until(
+      clock:,
+      within: budget,
+      every: poll.Fixed(1),
+      from: Nil,
+      attempt: fn(_) {
+        let remaining = deadline - clock.now()
+        case remaining > 0 {
+          False ->
+            poll.Broken(requests.TransportFailed(
+              "mcp actor did not settle the exchange",
+            ))
+          True ->
+            case process.selector_receive(selector, remaining) {
+              Error(Nil) ->
+                poll.Broken(requests.TransportFailed(
+                  "mcp actor did not settle the exchange",
+                ))
+              Ok(Error(error)) -> poll.Broken(error)
+              Ok(Ok(RawResult(Ok(value)))) -> poll.Settled(value)
+              Ok(Ok(RawResult(Error(error)))) -> poll.Broken(error)
+              Ok(Ok(RawNotification(value))) -> {
+                // Observer time consumes the same monotonic exchange budget.
+                outbound.on_notification(value)
+                poll.Pending(Nil)
+              }
+            }
+        }
+      },
+    )
+  {
+    poll.Answer(value) -> Ok(value)
+    poll.Failure(error) -> Error(error)
+    poll.RanOut(_) ->
+      Error(requests.TransportFailed("mcp actor did not settle the exchange"))
+  }
+}
+
+fn handle_raw_request(
+  state: State,
+  outbound: requests.Outbound,
+  reply: Subject(RawEvent),
+) -> sm.Next(Phase, State, Msg) {
+  let admitted = {
+    use Nil <- result.try(
+      case outbound.timeout_ms >= 1 && outbound.timeout_ms <= 4_294_966_295 {
+        True -> Ok(Nil)
+        False ->
+          Error(requests.InvalidArguments(
+            "outbound timeout is outside supported timer bounds",
+          ))
+      },
+    )
+    use original <- result.try(
+      jsonrpc.decode_value(outbound.envelope)
+      |> result.map_error(fn(_) {
+        requests.InvalidArguments("invalid outbound envelope")
+      }),
+    )
+    use id <- result.try(case original {
+      jsonrpc.Correlated(jsonrpc.ServerRequest(id, _, _)) -> Ok(id)
+      _ ->
+        Error(requests.InvalidArguments("outbound exchange must be a request"))
+    })
+    use caller <- result.try(
+      process.subject_owner(reply)
+      |> result.replace_error(requests.TransportFailed(
+        "request owner disappeared",
+      )),
+    )
+    use Nil <- result.try(case state.dead, dict.size(state.inflight) < 128 {
+      None, True -> Ok(Nil)
+      Some(reason), _ -> Error(requests.TransportFailed(reason))
+      None, False ->
+        Error(requests.TransportFailed("too many outstanding stdio requests"))
+    })
+    Ok(#(id, caller))
+  }
+  case admitted {
+    Error(error) -> {
+      process.send(reply, RawResult(Error(error)))
+      sm.keep(state)
+    }
+    Ok(#(original_id, caller)) -> {
+      let id = state.next_id
+      let stream = outbound_stream(outbound, jsonrpc.IdInt(id))
+      let reply =
+        ModernReply(original_id, reply, process.monitor(caller), stream)
+      let inflight =
+        dict.insert(state.inflight, id, InFlight(reply, outbound.timeout_ms))
+      let state = State(..state, next_id: id + 1, inflight:)
+      let message = replace_request_id(outbound.envelope, jsonrpc.IdInt(id))
+      case state.connection.send(stdio.frame(message)) {
+        Ok(Nil) -> {
+          let _ =
+            process.send_after(state.commands, outbound.timeout_ms, Expire(id))
+          sm.keep(state)
+        }
+        Error(Nil) -> begin_close(state, "mcp transport write failed")
+      }
+    }
+  }
+}
+
+fn replace_request_id(value: JsonValue, id: Id) -> JsonValue {
+  case value {
+    json.Object(fields) ->
+      json.Object(
+        list.map(fields, fn(pair) {
+          case pair.0 {
+            "id" -> #("id", encode_id(id))
+            _ -> pair
+          }
+        }),
+      )
+    _ -> value
+  }
+}
+
+fn settle_answer(
+  reply: Reply,
+  outcome: Result(JsonValue, jsonrpc.RpcError),
+) -> Nil {
+  case reply {
+    LegacyReply(subject) -> process.send(subject, outcome_to_result(outcome))
+    ModernReply(original, subject, monitor, _) -> {
+      process.demonitor_process(monitor)
+      let envelope = case outcome {
+        Ok(result) ->
+          jsonrpc.response(
+            original,
+            replace_result_subscription_id(result, original),
+          )
+        Error(error) -> jsonrpc.error_response(Some(original), error)
+      }
+      process.send(subject, RawResult(Ok(envelope)))
+    }
+  }
+}
+
+fn settle_failure(reply: Reply, error: ClientError) -> Nil {
+  case reply {
+    LegacyReply(subject) -> process.send(subject, Error(error))
+    ModernReply(_, subject, monitor, _) -> {
+      process.demonitor_process(monitor)
+      process.send(
+        subject,
+        RawResult(
+          Error(
+            requests.TransportFailed(case error {
+              Unavailable(reason) | ResultMalformed(reason) -> reason
+              CallTimedOut(_) -> "mcp request timed out"
+              ServerError(_, message) -> message
+              TooManyPages(_) -> "mcp pagination exceeded its bound"
+            }),
+          ),
+        ),
+      )
+    }
+  }
+}
+
+fn cancel_modern_wire(state: State, id: Int, reply: Reply) -> Nil {
+  case reply {
+    LegacyReply(_) -> Nil
+    ModernReply(..) -> {
+      let _ =
+        state.connection.send(
+          stdio.frame(jsonrpc.notification(
+            "notifications/cancelled",
+            Some(json.Object([#("requestId", json.Int(id))])),
+          )),
+        )
+      Nil
+    }
+  }
+}
+
+fn cancel_matching(
+  state: State,
+  matches: fn(Reply) -> Bool,
+) -> sm.Next(Phase, State, Msg) {
+  let matching =
+    dict.to_list(state.inflight)
+    |> list.filter(fn(pair) { matches(pair.1.reply) })
+  let inflight =
+    list.fold(matching, state.inflight, fn(inflight, pair) {
+      cancel_modern_wire(state, pair.0, pair.1.reply)
+      settle_failure(pair.1.reply, Unavailable("mcp request was cancelled"))
+      dict.delete(inflight, pair.0)
+    })
+  sm.keep(State(..state, inflight:))
+}
+
+fn route_notification(
+  state: State,
+  method: String,
+  params: Option(JsonValue),
+) -> Result(State, String) {
+  let notification = jsonrpc.notification(method, params)
+  let id = case params {
+    Some(params) -> subscription.notification_id(params)
+    None -> Error("notification params missing")
+  }
+  case id {
+    Ok(jsonrpc.IdInt(id)) -> route_stream(state, id, notification)
+    Ok(jsonrpc.IdString(_)) | Error(_) -> Ok(state)
+  }
+}
+
+fn route_stream(
+  state: State,
+  id: Int,
+  notification: JsonValue,
+) -> Result(State, String) {
+  case dict.get(state.inflight, id) {
+    Ok(InFlight(ModernReply(original, reply, monitor, Some(stream)), deadline)) -> {
+      case subscription.accept(stream, notification) {
+        Ok(stream) -> {
+          process.send(
+            reply,
+            RawNotification(replace_subscription_id(notification, original)),
+          )
+          let updated =
+            InFlight(
+              ModernReply(original, reply, monitor, Some(stream)),
+              deadline,
+            )
+          Ok(State(..state, inflight: dict.insert(state.inflight, id, updated)))
+        }
+        Error(reason) -> {
+          cancel_modern_wire(
+            state,
+            id,
+            ModernReply(original, reply, monitor, Some(stream)),
+          )
+          process.demonitor_process(monitor)
+          process.send(
+            reply,
+            RawResult(Error(requests.InvalidResponse(reason))),
+          )
+          Ok(State(..state, inflight: dict.delete(state.inflight, id)))
+        }
+      }
+    }
+    _ -> Ok(state)
+  }
+}
+
+fn outbound_stream(
+  outbound: requests.Outbound,
+  id: Id,
+) -> Option(subscription.Stream) {
+  let decoded = {
+    use envelope <- result.try(
+      jsonrpc.decode_value(outbound.envelope) |> result.replace_error(Nil),
+    )
+    use fields <- result.try(case envelope {
+      jsonrpc.Correlated(jsonrpc.ServerRequest(
+        _,
+        "subscriptions/listen",
+        Some(json.Object(fields)),
+      )) -> Ok(fields)
+      _ -> Error(Nil)
+    })
+    use filter <- result.try(list.key_find(fields, "notifications"))
+    subscription.decode(filter) |> result.replace_error(Nil)
+  }
+  decoded |> result.map(subscription.stream(id, _)) |> option.from_result
+}
+
+fn replace_subscription_id(notification: JsonValue, original: Id) -> JsonValue {
+  map_object(notification, fn(pair) {
+    case pair.0 {
+      "params" -> #(pair.0, replace_result_subscription_id(pair.1, original))
+      _ -> pair
+    }
+  })
+}
+
+fn replace_result_subscription_id(value: JsonValue, original: Id) -> JsonValue {
+  map_object(value, fn(pair) {
+    case pair.0 {
+      "_meta" -> #(
+        pair.0,
+        map_object(pair.1, fn(pair) {
+          case pair.0 {
+            "io.modelcontextprotocol/subscriptionId" -> #(
+              pair.0,
+              encode_id(original),
+            )
+            _ -> pair
+          }
+        }),
+      )
+      _ -> pair
+    }
+  })
+}
+
+fn map_object(
+  value: JsonValue,
+  map: fn(#(String, JsonValue)) -> #(String, JsonValue),
+) -> JsonValue {
+  case value {
+    json.Object(fields) -> json.Object(list.map(fields, map))
+    _ -> value
+  }
+}
+
+/// A validated modern tools catalog and conservative cache freshness.
+pub type ToolListing {
+  ToolListing(
+    /// Tools accepted by both schema compilation and endpoint binding policy.
+    tools: List(protocol.ToolDescriptor),
+    /// Exact single-page hints; multi-page snapshots are conservatively stale.
+    cache: discovery.CacheHint,
+  )
+}
+
+/// Lists tools with per-request metadata, bounded pagination and schema admission.
+///
+/// Invalid transport bindings exclude only their tool; valid siblings remain
+/// discoverable. The same monotonic request budget covers every page.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.list_tools_at(endpoint, options) returns descriptors and cache hints.
+/// ```
+pub fn list_tools_at(
+  endpoint: requests.Endpoint,
+  options: requests.Options,
+) -> Result(ToolListing, requests.Error) {
+  let clock = poll.monotonic()
+  let deadline = clock.now() + requests.timeout_ms(options)
+  modern_list_pages(
+    endpoint,
+    options,
+    clock,
+    deadline,
+    None,
+    [],
+    [],
+    None,
+    max_tool_pages,
+  )
+}
+
+fn modern_list_pages(
+  endpoint: requests.Endpoint,
+  options: requests.Options,
+  clock: poll.Clock,
+  deadline: Int,
+  cursor: Option(String),
+  seen: List(String),
+  collected: List(protocol.ToolDescriptor),
+  cache: Option(discovery.CacheHint),
+  remaining: Int,
+) -> Result(ToolListing, requests.Error) {
+  use Nil <- result.try(case remaining > 0 && deadline > clock.now() {
+    True -> Ok(Nil)
+    False ->
+      Error(requests.InvalidResponse(
+        "tool listing exhausted its page or time budget",
+      ))
+  })
+  let params = case cursor {
+    None -> []
+    Some(value) -> [#("cursor", json.String(value))]
+  }
+  let options = requests.with_timeout(options, deadline - clock.now())
+  use value <- result.try(send_request(
+    endpoint,
+    "tools/list",
+    params,
+    None,
+    options,
+  ))
+  use result_type <- result.try(decode_result_type(
+    value,
+    metadata.revision(requests.metadata(options)),
+  ))
+  use Nil <- result.try(case result_type {
+    "complete" -> Ok(Nil)
+    _ ->
+      Error(requests.InvalidResponse("tools/list resultType must be complete"))
+  })
+  use hint <- result.try(
+    discovery.decode_cache(value) |> result.map_error(requests.InvalidResponse),
+  )
+  use page <- result.try(
+    protocol.decode_tools_page(value)
+    |> result.map_error(fn(error) {
+      requests.InvalidResponse(protocol_fault(error))
+    }),
+  )
+  let admitted =
+    list.filter(page.tools, fn(tool) {
+      case schema.new(tool.input_schema) {
+        Error(_) -> False
+        Ok(compiled) ->
+          requests.admit_schema(endpoint, compiled) |> result.is_ok
+      }
+    })
+  let collected = list.append(collected, admitted)
+  let cache = case cache {
+    None -> hint
+    Some(_) -> discovery.stale()
+  }
+  case page.next_cursor {
+    None -> Ok(ToolListing(collected, cache))
+    Some(next) ->
+      case list.contains(seen, next) {
+        True ->
+          Error(requests.InvalidResponse(
+            "tools/list repeated a continuation cursor",
+          ))
+        False ->
+          modern_list_pages(
+            endpoint,
+            options,
+            clock,
+            deadline,
+            Some(next),
+            [next, ..seen],
+            collected,
+            Some(cache),
+            remaining - 1,
+          )
+      }
+  }
+}
+
+fn validate_stream_result(
+  reply: Reply,
+  outcome: Result(JsonValue, jsonrpc.RpcError),
+) -> Result(JsonValue, jsonrpc.RpcError) {
+  case reply, outcome {
+    ModernReply(_, _, _, Some(stream)), Ok(value) ->
+      subscription.complete(stream, value)
+      |> result.map(fn(_) { value })
+      |> result.map_error(fn(reason) { jsonrpc.RpcError(-32_600, reason, None) })
+    _, _ -> outcome
+  }
+}
+
+fn admit_profile(
+  output: schema.Schema,
+  options: requests.Options,
+) -> Result(Nil, requests.Error) {
+  case version.is_modern(metadata.revision(requests.metadata(options))) {
+    True -> Ok(Nil)
+    False ->
+      case schema.value(output) {
+        json.Object(fields) ->
+          case list.key_find(fields, "type") {
+            Ok(json.String("object")) -> Ok(Nil)
+            _ ->
+              Error(requests.InvalidArguments(
+                "legacy typed output requires an object schema",
+              ))
+          }
+        _ ->
+          Error(requests.InvalidArguments(
+            "legacy typed output requires an object schema",
+          ))
+      }
+  }
+}
+
+/// A retained subscription worker borrowing a caller-owned native client.
+pub opaque type Listening {
+  Listening(run: weft.Detached(JsonValue, requests.Error), id: Id)
+}
+
+/// The observed lifetime of one retained native subscription.
+pub type ListenStatus {
+  /// The admitted subscription is still open.
+  ListeningPending
+
+  /// The peer gracefully completed the subscription.
+  ListeningCompleted(response: JsonValue)
+
+  /// The subscription failed and its worker has been retired.
+  ListeningFailed(error: requests.Error)
+
+  /// Every outcome and worker retirement has already been consumed.
+  ListeningDrained
+}
+
+/// Starts one modern subscription without blocking other native requests.
+///
+/// The calling process owns this handle and must poll or cancel it. Its
+/// notification observer runs inside the retained request worker. Canceling that
+/// worker causes the native actor to cancel the exact allocated wire request.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.listen(native, subscription.tools(), request.options("agent", "1"))
+/// ```
+pub fn listen(
+  native: Client,
+  filter: subscription.Filter,
+  options: requests.Options,
+) -> Result(Listening, requests.Error) {
+  use Nil <- result.try(
+    case version.is_modern(metadata.revision(requests.metadata(options))) {
+      True -> Ok(Nil)
+      False ->
+        Error(requests.InvalidArguments("subscriptions require modern metadata"))
+    },
+  )
+  let id = jsonrpc.IdInt(ffi_request.next_id())
+  let outbound = listen_with_id(options, filter, id)
+  let run =
+    weft.new([
+      fn() {
+        use envelope <- result.try(raw_exchange(native, outbound))
+        validate_listen_envelope(envelope)
+      },
+    ])
+    |> weft.deadline(outbound.timeout_ms + reply_margin_ms)
+    |> weft.start_detached
+  Ok(Listening(run, id))
+}
+
+/// Observes the same retained worker without issuing another request.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.poll_listening(handle, 0) performs a nonblocking observation.
+/// ```
+pub fn poll_listening(listening: Listening, within: Int) -> ListenStatus {
+  case weft.pull(listening.run, within: int.clamp(within, 0, 4_294_966_295)) {
+    weft.NotYet -> ListeningPending
+    weft.AllDelivered -> ListeningDrained
+    weft.RunLost(_) ->
+      ListeningFailed(requests.TransportFailed("subscription scope was lost"))
+    weft.PulledOutcome(weft.Completed(_, value)) -> ListeningCompleted(value)
+    weft.PulledOutcome(weft.Failed(_, error)) -> ListeningFailed(error)
+    weft.PulledOutcome(_) ->
+      ListeningFailed(requests.TransportFailed("subscription interrupted"))
+  }
+}
+
+/// Cancels the retained worker and joins it before reporting completion.
+///
+/// The borrowed native client remains available to other callers. Joining this
+/// worker does not roll back remote effects or automatically replay a request.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.cancel_listening(handle) retires one stream.
+/// ```
+pub fn cancel_listening(listening: Listening) -> Result(Nil, requests.Error) {
+  weft.cancel_detached(listening.run)
+  drain_listening(listening.run)
+}
+
+fn drain_listening(
+  run: weft.Detached(JsonValue, requests.Error),
+) -> Result(Nil, requests.Error) {
+  case weft.pull(run, within: 1000) {
+    weft.AllDelivered -> Ok(Nil)
+    weft.RunLost(_) ->
+      Error(requests.TransportFailed("subscription drain could not be proven"))
+    weft.NotYet | weft.PulledOutcome(_) -> drain_listening(run)
+  }
+}
+
+/// Returns the caller-visible identifier used by notification observers.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // client.listening_id(handle) matches acknowledgement subscriptionId.
+/// ```
+pub fn listening_id(listening: Listening) -> Id {
+  listening.id
+}
+
+fn validate_listen_envelope(
+  envelope: JsonValue,
+) -> Result(JsonValue, requests.Error) {
+  use decoded <- result.try(
+    jsonrpc.decode_value(envelope)
+    |> result.replace_error(requests.InvalidResponse(
+      "invalid subscription response",
+    )),
+  )
+  case decoded {
+    jsonrpc.Correlated(jsonrpc.Response(_, Ok(_))) -> Ok(envelope)
+    jsonrpc.Correlated(jsonrpc.Response(_, Error(error)))
+    | jsonrpc.UncorrelatedError(error) -> Error(requests.RpcFailed(error))
+    _ ->
+      Error(requests.InvalidResponse("subscription did not receive a response"))
   }
 }

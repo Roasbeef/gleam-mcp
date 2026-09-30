@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import time
+import tempfile
 import unittest
 
 
@@ -125,6 +127,85 @@ class NativeStdio(unittest.TestCase):
         self.assertIn(b"request_timed_out", result.stderr)
         answers = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([answer["id"] for answer in answers], [1])
+
+    def test_modern_control_requests_interleave_with_blocked_handler(self):
+        meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}}
+        with subprocess.Popen(FIXTURE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) as child:
+            try:
+                child.stdin.write(framed([
+                    request("tools/call", 101, {"_meta": meta, "name": "blocked", "arguments": {}}),
+                    request("subscriptions/listen", 202, {"_meta": meta, "notifications": {"toolsListChanged": True}}),
+                    request("server/discover", 303, {"_meta": meta}),
+                ]))
+                child.stdin.flush()
+                reader = FrameReader(child.stdout)
+                ack = json.loads(reader.read(3))
+                discovered = json.loads(reader.read(3))
+                self.assertEqual(ack["method"], "notifications/subscriptions/acknowledged")
+                self.assertEqual(ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 202)
+                self.assertEqual(ack["params"]["notifications"], {})
+                self.assertEqual(discovered["id"], 303)
+                self.assertEqual(discovered["result"]["resultType"], "complete")
+                child.stdin.write(framed([request("notifications/cancelled", params={"requestId": 101})]))
+                child.stdin.flush()
+                cancelled = json.loads(reader.read(3))
+                self.assertEqual(cancelled["id"], 101)
+                self.assertIn("error", cancelled)
+                child.stdin.close()
+                closed = json.loads(reader.read(3))
+                self.assertEqual(closed["id"], 202)
+                self.assertEqual(closed["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 202)
+                self.assertEqual(child.wait(timeout=5), 0, child.stderr.read().decode())
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_real_modern_native_client_preserves_subscription_and_continuation(self):
+        python = shutil.which("python3")
+        peer = str(ROOT / "test/support/modern_peer.py")
+        expression = (f'support@modern_stdio_client:run(<<{json.dumps(python)}>>,'
+                      f'<<{json.dumps(peer)}>>),erlang:halt(0).')
+        result = subprocess.run(command(expression), capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        self.assertEqual(result.stdout.strip(), b"NATIVE_MODERN_OK")
+
+    def test_typed_contract_compile_failures(self):
+        # One private consumer cache avoids mutating the shared SDK build.
+        with tempfile.TemporaryDirectory(prefix="mcp-typed-fixtures-") as directory:
+            fixture = Path(directory)
+            # A private SDK snapshot uses the exact resolved dependency cache.
+            # The fixture module is a separate module, so opaque construction
+            # remains forbidden even within the same Gleam package.
+            shutil.copytree(ROOT / "src", fixture / "src")
+            shutil.copytree(ROOT / "build", fixture / "build")
+            shutil.copy2(ROOT / "gleam.toml", fixture / "gleam.toml")
+            shutil.copy2(ROOT / "manifest.toml", fixture / "manifest.toml")
+            positive = ("import gleam_mcp/client\nimport gleam_mcp/request\n"
+                        "import gleam_mcp/tool\n"
+                        "pub fn accept(endpoint: request.Endpoint, definition: tool.Tool(Int, String)) "
+                        "-> Result(client.CallOutcome(String), request.Error) { "
+                        'client.call(endpoint, definition, 1, request.options("fixture", "1")) }\n')
+            module = fixture / "src/fixture.gleam"
+            module.write_text(positive)
+            built = subprocess.run(["gleam", "build", "--warnings-as-errors"], cwd=fixture,
+                                   capture_output=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stdout.decode() + built.stderr.decode())
+            negatives = [
+                (positive.replace('definition, 1,', 'definition, "wrong",'), "Type mismatch"),
+                (positive.replace('Result(client.CallOutcome(String)', 'Result(client.CallOutcome(Int)'), "Type mismatch"),
+                ('import gleam_mcp/tool\npub fn forge() { tool.Tool() }\n', "Unknown module value"),
+            ]
+            for source, expected in negatives:
+                with self.subTest(diagnostic=expected, source=source):
+                    module.write_text(source)
+                    refused = subprocess.run(["gleam", "build", "--warnings-as-errors"], cwd=fixture,
+                                             capture_output=True, timeout=30)
+                    diagnostics = refused.stdout.decode() + refused.stderr.decode()
+                    self.assertNotEqual(refused.returncode, 0, diagnostics)
+                    self.assertIn(expected, diagnostics)
 
     def test_native_byte_cap_counts_unicode_bytes(self):
         expression = "io:format(\"~p~n\",[gleam_mcp_ffi:stdio_read_line(8)]),erlang:halt(0)."

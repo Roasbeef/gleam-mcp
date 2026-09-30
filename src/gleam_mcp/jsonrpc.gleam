@@ -77,6 +77,97 @@ pub type MessageFault {
   BadMessage(reason: String)
 }
 
+/// Modern response decoding retains an error that has no correlatable id.
+pub type ModernInbound {
+  /// An ordinary request, notification, or correlated response.
+  Correlated(message: Inbound)
+
+  /// An error whose request could not be identified; its id is omitted.
+  UncorrelatedError(error: RpcError)
+}
+
+/// Decodes a modern envelope already parsed by its transport boundary.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // jsonrpc.decode_value(error_without_id) returns UncorrelatedError.
+/// ```
+pub fn decode_value(value: JsonValue) -> Result(ModernInbound, MessageFault) {
+  use fields <- result.try(case value {
+    json.Object(fields) -> Ok(fields)
+    _ -> Error(BadMessage("a json object message"))
+  })
+  use Nil <- result.try(check_version(fields))
+  case
+    list.key_find(fields, "method"),
+    list.key_find(fields, "id"),
+    list.key_find(fields, "result"),
+    list.key_find(fields, "error")
+  {
+    Error(Nil), Error(Nil), Error(Nil), Ok(error) ->
+      decode_error(error) |> result.map(UncorrelatedError)
+    _, _, _, _ ->
+      case list.key_find(fields, "method") {
+        Ok(method) -> decode_call(fields, method) |> result.map(Correlated)
+        Error(Nil) -> decode_response(fields) |> result.map(Correlated)
+      }
+  }
+}
+
+/// Decodes modern JSON-RPC text, including errors with omitted ids.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // jsonrpc.decode_modern(line) preserves an uncorrelated error's data.
+/// ```
+pub fn decode_modern(text: String) -> Result(ModernInbound, MessageFault) {
+  use value <- result.try(
+    json.parse(text) |> result.map_error(MalformedMessage),
+  )
+  decode_value(value)
+}
+
+/// Encodes a correlated successful response.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // jsonrpc.response(jsonrpc.IdInt(1), result_value)
+/// ```
+pub fn response(id: Id, value: JsonValue) -> JsonValue {
+  json.Object([
+    #("jsonrpc", json.String(version)),
+    #("id", encode_id(id)),
+    #("result", value),
+  ])
+}
+
+/// Encodes an error, omitting an id when correlation is unavailable.
+///
+/// ## Examples
+///
+/// ```gleam
+/// // jsonrpc.error_response(None, jsonrpc.RpcError(-32700, "parse error", None))
+/// ```
+pub fn error_response(id: Option(Id), error: RpcError) -> JsonValue {
+  let fields = [#("jsonrpc", json.String(version))]
+  let fields = case id {
+    None -> fields
+    Some(id) -> list.append(fields, [#("id", encode_id(id))])
+  }
+  let details = [
+    #("code", json.Int(error.code)),
+    #("message", json.String(error.message)),
+  ]
+  let details = case error.data {
+    None -> details
+    Some(value) -> list.append(details, [#("data", value)])
+  }
+  json.Object(list.append(fields, [#("error", json.Object(details))]))
+}
+
 // --- encoding --------------------------------------------------------------
 
 /// Encodes one request. `params` is omitted from the wire entirely when

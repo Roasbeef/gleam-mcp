@@ -225,22 +225,23 @@ pub fn lookahead_read_fault_joins_the_handler_before_return_test() {
     // Repeating the synchronized interruption exercises scheduler order without
     // substituting a timing threshold for the actual process-liveness witness.
     int.range(from: 1, to: 21, with: Nil, run: fn(_, _) {
-      interrupted_handler(fault)
+      interrupted_handler(
+        fault,
+        fn(registry) { registry },
+        protocol.call_tool_request(jsonrpc.IdInt(2), "echo", json.Object([])),
+      )
     })
   })
 }
 
-fn interrupted_handler(fault: server_stdio.StdioError) -> Nil {
+fn interrupted_handler(
+  fault: server_stdio.StdioError,
+  profile: fn(server.Server) -> server.Server,
+  envelope: json.JsonValue,
+) -> Nil {
   let handler_entered = process.new_subject()
   let reader_entered = process.new_subject()
-  let #(reader, read) =
-    input([
-      json.to_string(protocol.call_tool_request(
-        jsonrpc.IdInt(2),
-        "echo",
-        json.Object([]),
-      )),
-    ])
+  let #(reader, read) = input([json.to_string(envelope)])
   let read = fn() {
     case read() {
       Ok(None) -> {
@@ -272,6 +273,7 @@ fn interrupted_handler(fault: server_stdio.StdioError) -> Nil {
           )
         let #(server, _) =
           server.handle_line(server, json.to_string(protocol.initialized()))
+        let server = profile(server)
         let verdict =
           server_stdio.run_with_io(server, server_stdio.options(), read, fn(_) {
             Ok(Nil)
@@ -299,6 +301,119 @@ fn interrupted_handler(fault: server_stdio.StdioError) -> Nil {
     |> process.select_specific_monitor(watch, fn(down) { down })
     |> process.selector_receive(0)
     as "handler DOWN is already observable at runner return"
+  assert weft.pull(run, within: 1000) == weft.AllDelivered
+  process.kill(reader)
+}
+
+pub fn modern_read_fault_joins_live_handler_before_return_test() {
+  list.each([server_stdio.ReadFailed, server_stdio.LineTooLong], fn(fault) {
+    let envelope =
+      jsonrpc.request(
+        jsonrpc.IdInt(2),
+        "tools/call",
+        Some(
+          json.Object([
+            #(
+              "_meta",
+              json.Object([
+                #(
+                  "io.modelcontextprotocol/protocolVersion",
+                  json.String("2026-07-28"),
+                ),
+                #("io.modelcontextprotocol/clientCapabilities", json.Object([])),
+              ]),
+            ),
+            #("name", json.String("echo")),
+            #("arguments", json.Object([])),
+          ]),
+        ),
+      )
+    interrupted_handler(fault, server.modern, envelope)
+  })
+}
+
+pub fn modern_write_failure_joins_blocked_handler_before_return_test() {
+  let entered = process.new_subject()
+  let reader_waiting = process.new_subject()
+  let meta =
+    json.Object([
+      #("io.modelcontextprotocol/protocolVersion", json.String("2026-07-28")),
+      #("io.modelcontextprotocol/clientCapabilities", json.Object([])),
+    ])
+  let call =
+    jsonrpc.request(
+      jsonrpc.IdInt(1),
+      "tools/call",
+      Some(
+        json.Object([
+          #("_meta", meta),
+          #("name", json.String("echo")),
+          #("arguments", json.Object([])),
+        ]),
+      ),
+    )
+  let discover =
+    jsonrpc.request(
+      jsonrpc.IdInt(2),
+      "server/discover",
+      Some(json.Object([#("_meta", meta)])),
+    )
+  let discover_line = json.to_string(discover)
+  let #(reader, read) = input([json.to_string(call), discover_line])
+  let read = fn() {
+    let answer = read()
+    case answer {
+      Ok(Some(line)) if line == discover_line -> {
+        let gate = process.new_subject()
+        process.send(reader_waiting, gate)
+        let Nil = process.receive_forever(gate)
+        answer
+      }
+      _ -> answer
+    }
+  }
+  let run =
+    weft.new([
+      fn() {
+        let record = process.new_subject()
+        let registry =
+          echo_server(fn(_) {
+            let blocked: process.Subject(Nil) = process.new_subject()
+            process.send(record, process.self())
+            process.send(entered, process.self())
+            let Nil = process.receive_forever(blocked)
+            Ok(server.text("unreachable"))
+          })
+          |> server.modern
+        let verdict =
+          server_stdio.run_with_io(
+            registry,
+            server_stdio.options(),
+            read,
+            fn(_) { Error(Nil) },
+          )
+        let assert Ok(handler) = process.receive(record, 0)
+          as "admitted worker identity is retained"
+        Ok(#(verdict, process.is_alive(handler)))
+      },
+    ])
+    |> weft.start_detached
+  let assert Ok(handler) = process.receive(entered, 1000)
+    as "tool is blocked before control response fails"
+  let monitor = process.monitor(handler)
+  let assert Ok(gate) = process.receive(reader_waiting, 1000)
+    as "discovery admission waits for blocked handler"
+  process.send(gate, Nil)
+  let assert weft.PulledOutcome(weft.Completed(_, #(verdict, alive))) =
+    weft.pull(run, within: 1000)
+    as "write-failure owner returns after draining"
+  assert verdict == Error(server_stdio.WriteFailed)
+  assert !alive
+  let assert Ok(process.ProcessDown(..)) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(0)
+    as "worker DOWN already exists at public return"
   assert weft.pull(run, within: 1000) == weft.AllDelivered
   process.kill(reader)
 }
