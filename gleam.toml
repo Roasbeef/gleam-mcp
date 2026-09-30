@@ -11,9 +11,9 @@ gleam_otp = ">= 1.0.0 and < 2.0.0"
 weft = "== 0.4.5"
 gleam_regexp = ">= 1.0.0 and < 2.0.0"
 gleam_http = ">= 4.0.0 and < 5.0.0"
-glisten = ">= 9.0.0 and < 10.0.0"
+glisten = { git = "https://github.com/Roasbeef/glisten.git", ref = "3eb785919be0736da0a20732a56275dce0132327" }
 gun = ">= 2.6.0 and < 3.0.0"
-mist = { git = "https://github.com/Roasbeef/mist.git", ref = "1a81d90d58deac4f95e4a996e57279bc32dfd1a0" }
+mist = { git = "https://github.com/Roasbeef/mist.git", ref = "28b43178ff57bfb619c64b8c3544831646d5fdb9" }
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
