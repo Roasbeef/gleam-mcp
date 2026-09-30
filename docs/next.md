@@ -1,10 +1,10 @@
 # Current handoff
 
-Audited on 2026-09-30 against protocol source baseline `fdc4fbf` and lock `b918f7a`. The
+Audited on 2026-09-30 against protocol source baseline `c3422db` and lock `7558e23`. The
 initial published extraction baseline is `ed5758bb11939ceab4adaceda26e891172550ec1`;
 its complete Linux and macOS CI passed in run `36687863801`. The previous
 handoff's claim that initial publication was pending is superseded by that
-result. This edition records the completed local protocol extension separately from that baseline.
+result. This edition records the subsequent typed protocol and bounded HTTP extension separately from that baseline.
 
 ## Where the tree is
 
@@ -26,13 +26,23 @@ ECMAScript equivalence or native regex wall-clock bounds from that census.
 
 The complete `make check` gate passed with 232 unit tests (including all
 required schema vectors), 139 linter tests, five negative tooling checks,
-nine native stdio checks and 27 native HTTP/TLS checks. Its own exit status
+nine native stdio checks and 30 native HTTP/TLS checks. Its own exit status
 was zero. Independent Astra review found malformed argument classification,
 subscription completion admission and a false-pass regression fixture; all
-three were fixed and rechecked in the same review context. Jevelin's four
-tools and a separate native typed client also passed against a private SDK
-snapshot. Published consumer pins and their exact-head hosted results are
-separate acceptance criteria, never implied by this local gate.
+three were fixed and rechecked in the same review context. A later Linux
+consumer failure exposed unread rejected HTTP bodies; the final native gate
+now verifies status delivery, actual socket reuse, and framing refusal before
+callbacks. The existing Mist fork is pinned to `1a81d90`, whose full CI
+passed [run 36712967634](https://github.com/Roasbeef/mist/actions/runs/36712967634).
+Its parser regression fails against the original code and passes with the fix.
+
+Jevelin's four tools and separate native typed client passed at the prior
+published SDK pin. Consumer pins and their exact-head hosted results remain
+separate acceptance criteria, never implied by the SDK gate. Loom's full
+local gate and required Linux hosted gate passed at extraction head
+`cd932374`; its hosted macOS e2e failure also reproduces on exact base main
+`01f14ef8` at `worktree_diff_test.gleam:95`. Read consumer evidence at the
+commit and CI run that actually produced it.
 
 ## Rulings already made
 
@@ -55,6 +65,10 @@ Origins and mirrored headers validate before effects. Gun verifies HTTPS
 peers and hostnames, disables retries and joins the actual connection owner
 before return. Mist owns parsing and supervision; the narrow close-event
 adapter exists because its public SSE interface omits socket-close delivery.
+Server uploads require unambiguous `Content-Length` framing within eight MiB;
+unsupported chunked uploads close before body collection. Bounded refusal
+drains use a shared fifteen-second budget plus at most one native read;
+this is not a claim of an aggregate deadline for every admitted body read.
 
 The initial custody regression has positive synchronized liveness witnesses,
 but restoring the old custody code passed under the ordinary scheduler.

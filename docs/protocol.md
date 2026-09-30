@@ -71,6 +71,15 @@ policy. A present Origin must match the explicit allowlist, including before
 routing and authentication. Origin validation and authentication are separate
 checks. Descriptive client identity isn't authentication.
 
+The listener admits unambiguous `Content-Length` framing up to eight MiB;
+chunked transfer encoding is refused before body collection. Mist's current
+chunked reader can retain a whole declared chunk before yielding, so the SDK
+cannot impose its byte limit on that path. Bounded rejected bodies are
+consumed without JSON parsing or handler admission before a keepalive
+response. That discard has a shared fifteen-second budget plus at most one
+fifteen-second native read. Incomplete or unsupported bodies close the
+connection; status delivery is not guaranteed when a peer keeps writing.
+
 Mist owns HTTP parsing and listener supervision. A stream actor receives
 socket ownership before admitting its weft handler scope. Native socket-close
 messages initiate cancellation; the actor waits for the scope's drained

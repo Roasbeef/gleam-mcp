@@ -97,7 +97,9 @@ and call `server_http.start_server`. The listener binds `127.0.0.1`; choose
 `Authenticate(check)` or explicitly select `LocalUnauthenticated`. Every
 present Origin must match the allowlist. Remote TLS deployments use a front
 proxy with their host admission policy. The client supports HTTPS with peer
-and hostname verification.
+and hostname verification. Server request bodies require unambiguous
+`Content-Length` framing and are limited to eight MiB; chunked uploads are
+refused before body collection.
 
 Requests use a single POST endpoint and accept JSON or request-scoped SSE.
 Mirrored metadata and `x-mcp-header` bindings validate before tool effects.
