@@ -1,6 +1,14 @@
 //// Per-request metadata replaces initialized session state in modern MCP.
 //// Client identity is descriptive data, never authorization. Unknown metadata
 //// remains intact while required protocol fields are decoded at this boundary.
+////
+//// ## Flow
+////
+//// new and with_client build descriptive request metadata; with_revision updates
+//// the wire key and the stored revision together. decode -> version.decode ->
+//// validate_identity admits required fields while retaining unknown extension
+//// fields. value serializes that same field list. Metadata validates structure;
+//// authorization belongs to the host's transport and tool admission policy.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -19,16 +27,28 @@ pub const client_info_key = "io.modelcontextprotocol/clientInfo"
 
 /// Metadata admitted for one request, with no inherited connection state.
 pub opaque type Metadata {
-  Metadata(revision: Version, fields: List(#(String, JsonValue)))
+  /// The parsed metadata or revision and preserved fields for this module.
+  Metadata(
+    /// The decoded contract, kept consistent with its wire field.
+    revision: Version,
+    /// The admitted field list, including unknown metadata extensions.
+    fields: List(#(String, JsonValue)),
+  )
 }
 
 /// A refusal at the request metadata boundary.
 pub type Fault {
   /// A required field was absent or had the wrong shape.
-  InvalidMetadata(reason: String)
+  InvalidMetadata(
+    /// The required metadata shape that failed.
+    reason: String,
+  )
 
   /// The requested contract is not implemented.
-  UnsupportedVersion(requested: String)
+  UnsupportedVersion(
+    /// The unsupported revision string received from the peer.
+    requested: String,
+  )
 }
 
 /// Builds metadata with no optional client capabilities.
@@ -36,7 +56,7 @@ pub type Fault {
 /// ## Examples
 ///
 /// ```gleam
-/// // metadata.new(version.V20260728) declares an empty capabilities object.
+/// assert metadata.capabilities(metadata.new(version.V20260728)) == json.Object([])
 /// ```
 pub fn new(revision: Version) -> Metadata {
   Metadata(revision, [
@@ -50,7 +70,8 @@ pub fn new(revision: Version) -> Metadata {
 /// ## Examples
 ///
 /// ```gleam
-/// // metadata.new(version.V20260728) |> metadata.with_client("agent", "1")
+/// let meta = metadata.new(version.V20260728) |> metadata.with_client("agent", "1")
+/// assert metadata.revision(meta) == version.V20260728
 /// ```
 pub fn with_client(
   metadata: Metadata,
@@ -90,7 +111,8 @@ pub fn revision(metadata: Metadata) -> Version {
 /// ## Examples
 ///
 /// ```gleam
-/// // metadata.with_revision(meta, version.V20250618)
+/// let meta = metadata.new(version.V20260728) |> metadata.with_revision(version.V20250618)
+/// assert metadata.revision(meta) == version.V20250618
 /// ```
 pub fn with_revision(metadata: Metadata, revision: Version) -> Metadata {
   Metadata(
@@ -107,7 +129,10 @@ pub fn with_revision(metadata: Metadata, revision: Version) -> Metadata {
 /// ## Examples
 ///
 /// ```gleam
-/// // metadata.value(meta) is placed in params._meta.
+/// assert metadata.value(metadata.new(version.V20260728)) == json.Object([
+///   #(metadata.protocol_version_key, json.String("2026-07-28")),
+///   #(metadata.capabilities_key, json.Object([])),
+/// ])
 /// ```
 pub fn value(metadata: Metadata) -> JsonValue {
   json.Object(metadata.fields)
@@ -121,6 +146,9 @@ pub fn value(metadata: Metadata) -> JsonValue {
 /// assert metadata.decode(json.Object([])) |> result.is_error
 /// ```
 pub fn decode(value: JsonValue) -> Result(Metadata, Fault) {
+  // The stored revision is decoded from the preserved wire object in the same
+  // pass, so later dispatch cannot use a different contract from its metadata.
+
   use fields <- result.try(case value {
     json.Object(fields) -> Ok(fields)
     _ -> Error(InvalidMetadata("_meta must be an object"))
@@ -166,7 +194,7 @@ fn validate_identity(value: Option(JsonValue)) -> Result(Nil, Fault) {
 /// ## Examples
 ///
 /// ```gleam
-/// // metadata.capabilities(metadata.new(version.V20260728)) is an empty object.
+/// assert metadata.capabilities(metadata.new(version.V20260728)) == json.Object([])
 /// ```
 pub fn capabilities(meta: Metadata) -> JsonValue {
   list.key_find(meta.fields, capabilities_key) |> result.unwrap(json.Object([]))

@@ -1,6 +1,13 @@
 //// Protocol revisions select a wire contract independently of the transport.
 //// Legacy revisions retain initialization; the modern revision carries its
 //// contract on each request and never needs connection-scoped negotiation.
+////
+//// ## Flow
+////
+//// decode maps a wire string to one supported Version; name maps it back without
+//// losing the selected contract. supported lists both initialized compatibility
+//// profiles and the modern per-request profile. is_modern selects lifecycle shape,
+//// while the transport still controls which profiles it admits.
 
 import gleam/list
 

@@ -1,5 +1,13 @@
 //// Shared JSON operations keep schema and instance equality independent of
 //// textual property order and the parser's integer-versus-float representation.
+////
+//// ## Flow
+////
+//// get distinguishes an absent property from a present value; field supplies a
+//// keyword-specific default. equal recursively compares objects by name, arrays
+//// by position, and mixed numeric representations through number.compare. unique
+//// uses that equality so integer 1 and floating 1.0 count as duplicates.
+//// fields, items and at are shape helpers for already checked schema keywords.
 
 import gleam/list
 import gleam/result
@@ -39,6 +47,9 @@ pub fn field(value: JsonValue, key: String, fallback: JsonValue) -> JsonValue {
 /// assert value.equal(json.Int(1), json.Float(1.0))
 /// ```
 pub fn equal(left: JsonValue, right: JsonValue) -> Bool {
+  // Object field order is irrelevant to schema equality, but array position
+  // is significant. Numeric equality follows the decimal comparison boundary.
+
   case left, right {
     json.Object(a), json.Object(b) -> {
       list.length(a) == list.length(b)

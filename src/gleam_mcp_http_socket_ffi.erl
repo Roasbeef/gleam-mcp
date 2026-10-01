@@ -1,4 +1,10 @@
-%% Exact socket identity prevents another connection from cancelling this stream.
+%% Mist's SSE interface omits socket-close delivery. Gleam retains the opaque
+%% socket and selects raw events; this adapter classifies those native terms.
+%%
+%% Flow: classify returns closed, unexpected_data or unrelated. Every admitted
+%% TCP or TLS arm repeats the exact socket identity, so an event from another
+%% connection cannot cancel this stream. Gleam owns the ensuing scope drain.
+%% Unexpected request data closes the stream rather than reusing its socket.
 -module(gleam_mcp_http_socket_ffi).
 -export([classify/2]).
 classify(Socket, {tcp_closed, Socket}) -> closed;

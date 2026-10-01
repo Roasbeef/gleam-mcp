@@ -2,6 +2,18 @@
 //// UTF-8 code points and CRLF pairs may cross native HTTP body fragments. Each
 //// event is bounded independently so subscriptions do not require unbounded
 //// accumulation or a lifetime limit on the stream.
+////
+//// ## Flow
+////
+//// feed -> scan -> segment finds byte delimiters before line validates UTF-8.
+//// line collects data fields, ignores comments and unknown fields, and emits an
+//// event only at a blank line. add_data charges the multiline data and separators;
+//// append_line charges the pending line against the same event limit. finish checks
+//// for incomplete state. encode emits data lines without ids or replay support.
+////
+//// Decoder updates create new records; callers keep the returned Decoder for the
+//// next fragment. Decoding UTF-8 after a complete line lets a code point straddle
+//// native chunks without treating a truncated prefix as corrupt input.
 
 import gleam/bit_array
 import gleam/list
@@ -10,12 +22,19 @@ import gleam/string
 
 /// The bounded framing state of one response stream.
 pub opaque type Decoder {
+  /// The pending framing state for exactly one response stream.
   Decoder(
+    /// Bytes held until a complete UTF-8 line can be validated.
     line: BitArray,
+    /// Completed data fields in reverse order for one pending event.
     data: List(String),
+    /// Bytes charged for pending data fields and their separators.
     size: Int,
+    /// The positive per-line and per-event byte allowance.
     limit: Int,
+    /// Whether a preceding CR may absorb the next LF.
     newline: Newline,
+    /// Whether the optional initial UTF-8 BOM can still be stripped.
     start: Start,
   )
 }
@@ -34,7 +53,10 @@ type Start {
 ///
 /// ## Examples
 ///
-/// `new(1_048_576)` admits events of up to one MiB.
+/// ```gleam
+/// assert sse.new(0) |> result.is_error
+/// assert sse.new(1024) |> result.is_ok
+/// ```
 pub fn new(max_event_bytes: Int) -> Result(Decoder, String) {
   case max_event_bytes > 0 {
     True -> Ok(Decoder(<<>>, [], 0, max_event_bytes, Ordinary, FirstLine))
@@ -46,7 +68,12 @@ pub fn new(max_event_bytes: Int) -> Result(Decoder, String) {
 ///
 /// ## Examples
 ///
-/// `feed(decoder, <<"data: hello\n\n":utf8>>)` emits `"hello"`.
+/// ```gleam
+/// let assert Ok(decoder) = sse.new(1024)
+/// let assert Ok(#(decoder, events)) = sse.feed(decoder, <<"data: hello\n\n":utf8>>)
+/// assert events == ["hello"]
+/// assert sse.finish(decoder) == Ok(Nil)
+/// ```
 pub fn feed(
   decoder: Decoder,
   bytes: BitArray,
@@ -68,6 +95,8 @@ fn scan(
   }
 }
 
+// Scan delimiters as bytes and retain a whole UTF-8 line before decoding.
+// CR and LF are ASCII, so finding them cannot split a code point.
 fn segment(
   decoder: Decoder,
   source: BitArray,
@@ -111,6 +140,8 @@ fn append_line(decoder: Decoder, bytes: BitArray) -> Result(Decoder, String) {
   }
 }
 
+// A blank line commits the pending event and resets its allowance. Comments
+// and unknown fields produce no event; only data fields enter the payload.
 fn line(decoder: Decoder) -> Result(#(Decoder, List(String)), String) {
   use text <- result.try(
     bit_array.to_string(decoder.line)
@@ -159,7 +190,11 @@ fn add_data(
 ///
 /// ## Examples
 ///
-/// `finish(decoder)` refuses a trailing data line without a blank delimiter.
+/// ```gleam
+/// let assert Ok(decoder) = sse.new(1024)
+/// let assert Ok(#(decoder, _)) = sse.feed(decoder, <<"data: hello\n":utf8>>)
+/// assert sse.finish(decoder) |> result.is_error
+/// ```
 pub fn finish(decoder: Decoder) -> Result(Nil, String) {
   case decoder.line, decoder.data {
     <<>>, [] -> Ok(Nil)
@@ -171,7 +206,9 @@ pub fn finish(decoder: Decoder) -> Result(Nil, String) {
 ///
 /// ## Examples
 ///
-/// `encode("{}")` returns `"data: {}\n\n"`.
+/// ```gleam
+/// assert sse.encode("{}") == "data: {}\n\n"
+/// ```
 pub fn encode(message: String) -> String {
   "data: " <> string.replace(message, "\n", "\ndata: ") <> "\n\n"
 }

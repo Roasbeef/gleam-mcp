@@ -1,6 +1,13 @@
 //// Discovery describes installed server behavior without opening a session.
 //// Cache hints are data for caller-owned caches. A private hint never permits
 //// reuse across authorization contexts, and a zero TTL is immediately stale.
+////
+//// ## Flow
+////
+//// cache_hint and stale construct freshness values; cache_fields serializes them.
+//// decode -> decode_cache validates a peer's discovery result, preserving optional
+//// instructions and raw capabilities. No clock or cache lives here: the consumer
+//// chooses storage, expiry and separation between authenticated principals.
 
 import gleam/int
 import gleam/list
@@ -19,11 +26,18 @@ pub type CacheScope {
 
 /// A nonnegative freshness hint paired with an explicit cache scope.
 pub opaque type CacheHint {
-  CacheHint(ttl_ms: Float, scope: CacheScope)
+  /// The validated freshness hint; it stores no clock or cached response.
+  CacheHint(
+    /// The admitted nonnegative freshness duration, preserving fractional wire values.
+    ttl_ms: Float,
+    /// The authorization contexts in which a consumer may reuse this result.
+    scope: CacheScope,
+  )
 }
 
 /// A modern discovery result with optional server-authored guidance.
 pub type Discovery {
+  /// The validated discovery result with caller-owned caching hints.
   Discovery(
     /// Protocol contracts the server implements.
     supported_versions: List(String),
@@ -66,7 +80,7 @@ pub fn stale() -> CacheHint {
 /// ## Examples
 ///
 /// ```gleam
-/// // discovery.ttl_ms(hint) may retain a fractional wire duration.
+/// assert discovery.ttl_ms(discovery.stale()) == 0.0
 /// ```
 pub fn ttl_ms(hint: CacheHint) -> Float {
   hint.ttl_ms
@@ -88,7 +102,10 @@ pub fn cache_scope(hint: CacheHint) -> CacheScope {
 /// ## Examples
 ///
 /// ```gleam
-/// // discovery.cache_fields(hint) is appended to tools/list or server/discover.
+/// assert discovery.cache_fields(discovery.stale()) == [
+///   #("ttlMs", json.Float(0.0)),
+///   #("cacheScope", json.String("private")),
+/// ]
 /// ```
 pub fn cache_fields(hint: CacheHint) -> List(#(String, JsonValue)) {
   [

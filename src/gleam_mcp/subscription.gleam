@@ -2,6 +2,24 @@
 //// An immutable registry has no list-change source, so its acknowledgement
 //// contains an empty subset. The subscription remains open until cancellation,
 //// graceful shutdown or transport closure, even when that subset is empty.
+////
+//// ## Flow
+////
+//// decode constructs a requested tools filter. stream starts without an accepted
+//// subset; accept requires the matching acknowledgement first, then allows only
+//// notifications from that accepted subset. complete requires an acknowledged
+//// stream and matching id before admitting a final complete result. acknowledge
+//// and closed construct the server's corresponding control messages.
+////
+//// | Stream state | Input | Result |
+//// | --- | --- | --- |
+//// | Unacknowledged | Matching acknowledgement with a requested subset | Store the subset. |
+//// | Unacknowledged | Other notification or completion | Refuse. |
+//// | Acknowledged | Matching admitted tool-list notification | Preserve state. |
+//// | Acknowledged | Matching complete result | Permit transport retirement. |
+////
+//// The Stream validates values; the transport owns whether a worker is still live.
+//// An empty accepted filter keeps that same lifetime without allowing tool events.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -20,7 +38,11 @@ pub type ToolChanges {
 
 /// A validated tools filter, with other standardized filters unimplemented.
 pub opaque type Filter {
-  Filter(tools: ToolChanges)
+  /// The tools notification subset admitted by this module.
+  Filter(
+    /// Whether tool-list change notifications were requested.
+    tools: ToolChanges,
+  )
 }
 
 /// Decodes notification opt-in while checking the shapes of known filters.
@@ -28,7 +50,7 @@ pub opaque type Filter {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.decode(json.Object([])) requests an empty notification set.
+/// assert subscription.decode(json.Object([])) == Ok(subscription.empty())
 /// ```
 pub fn decode(value: JsonValue) -> Result(Filter, String) {
   use fields <- result.try(case value {
@@ -66,7 +88,7 @@ pub fn decode(value: JsonValue) -> Result(Filter, String) {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.tools() can be passed to client.listen.
+/// assert subscription.value(subscription.tools()) == json.Object([#("toolsListChanged", json.Bool(True))])
 /// ```
 pub fn tools() -> Filter {
   Filter(Requested)
@@ -77,7 +99,7 @@ pub fn tools() -> Filter {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.empty() still requires an acknowledgement.
+/// assert subscription.value(subscription.empty()) == json.Object([])
 /// ```
 pub fn empty() -> Filter {
   Filter(Omitted)
@@ -88,7 +110,7 @@ pub fn empty() -> Filter {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.value(subscription.tools()) contains toolsListChanged true.
+/// assert subscription.value(subscription.empty()) == json.Object([])
 /// ```
 pub fn value(filter: Filter) -> JsonValue {
   case filter.tools {
@@ -102,7 +124,10 @@ pub fn value(filter: Filter) -> JsonValue {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.acknowledge(id, subscription.empty()) acknowledges an empty subset.
+/// let id = jsonrpc.IdInt(1)
+/// let pending = subscription.stream(id, subscription.tools())
+/// assert subscription.accept(pending, subscription.acknowledge(id, subscription.empty()))
+///   |> result.is_ok
 /// ```
 pub fn acknowledge(id: Id, accepted: Filter) -> JsonValue {
   jsonrpc.notification(
@@ -167,7 +192,15 @@ fn identity(id: Id) -> JsonValue {
 
 /// A stream's admitted notification subset and acknowledgement state.
 pub opaque type Stream {
-  Stream(id: Id, requested: Filter, accepted: Option(Filter))
+  /// The correlation identity, requested filter and acknowledgement state.
+  Stream(
+    /// The wire identity every acknowledgement, event and completion must match.
+    id: Id,
+    /// The caller's opt-in filter, fixed for this stream.
+    requested: Filter,
+    /// None before acknowledgement; afterwards the admitted subset of requested sources.
+    accepted: Option(Filter),
+  )
 }
 
 /// Starts validation before any notification observer can be invoked.
@@ -175,7 +208,8 @@ pub opaque type Stream {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.stream(id, filter) initially requires an acknowledgement.
+/// let pending = subscription.stream(jsonrpc.IdInt(1), subscription.tools())
+/// assert subscription.complete(pending, json.Object([])) |> result.is_error
 /// ```
 pub fn stream(id: Id, requested: Filter) -> Stream {
   Stream(id, requested, None)
@@ -192,6 +226,10 @@ pub fn accept(
   stream: Stream,
   notification: JsonValue,
 ) -> Result(Stream, String) {
+  // Correlation precedes every state change. None means no acknowledgement has
+  // been admitted yet, while Some(filter) fixes the notification sources for
+  // the remainder of this stream.
+
   use envelope <- result.try(
     jsonrpc.decode_value(notification)
     |> result.map_error(fn(_) { "invalid subscription notification" }),
@@ -270,7 +308,7 @@ pub fn complete(stream: Stream, result: JsonValue) -> Result(Nil, String) {
 /// ## Examples
 ///
 /// ```gleam
-/// // subscription.acknowledged(json.Object([])) accepts an empty subset.
+/// assert subscription.acknowledged(json.Object([])) == Ok(subscription.empty())
 /// ```
 pub fn acknowledged(value: JsonValue) -> Result(Filter, String) {
   use fields <- result.try(case value {

@@ -1,4 +1,17 @@
-%% Gun owns HTTP parsing, connection shutdown, TLS and flow control.
+%% Gun owns HTTP parsing, TLS and flow control; Gleam owns request policy.
+%% These wrappers keep native calls behind ffi_http because the Gleam APIs
+%% expose neither Gun stream references nor its fragment delivery protocol.
+%%
+%% Flow: open returns the connection pid for managed-task adoption, then post
+%% waits for readiness and submits one request with one fragment of credit.
+%% next translates a fragment; credit renews delivery after Gleam consumes it.
+%% close synchronously joins the connection owner. Its infinite stop timeout
+%% is a retirement join, not an extension of the response deadline.
+%%
+%% retry is disabled so a transport failure cannot replay a tool effect.
+%% HTTPS verifies both certificate trust and hostname before application POST.
+%% An interrupted response reports unknown execution outcome; it cannot prove
+%% that the peer did no work. Deadline arithmetic uses monotonic milliseconds.
 -module(gleam_mcp_http_ffi).
 -export([open/4, post/5, next/3, credit/2, close/1, now/0]).
 

@@ -2,6 +2,16 @@
 //// This module owns admission ordering but no socket. HTTP stack integrations
 //// reuse the boundary so malformed headers cannot select one operation while
 //// the JSON body executes another.
+////
+//// ## Flow
+////
+//// headers -> metadata derives version, method and optional name from the exact
+//// outbound envelope. On receipt, validate -> metadata -> equal requires matching
+//// mirrors; arguments supplies the body values used by http_headers. Recognition
+//// of a named primitive here doesn't install a handler for that primitive.
+////
+//// The use bindings chain Results: each successful field becomes available to the
+//// next check, and the first Error ends decoding before dispatch can begin.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -12,6 +22,7 @@ import gleam_mcp/metadata
 
 /// The method, optional tool name, and revision bound to one request.
 pub type Metadata {
+  /// The parsed metadata or revision and preserved fields for this module.
   Metadata(
     /// The body method mirrored verbatim, with case-sensitive values.
     method: String,

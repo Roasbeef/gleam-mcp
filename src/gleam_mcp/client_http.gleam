@@ -2,6 +2,19 @@
 //// Gun retries are disabled. A missing final correlated response means unknown
 //// execution outcome; neither disconnect nor a header error replays effects.
 //// Deadlines cancel and join the connection and worker through weft.
+////
+//// ## Flow
+////
+//// endpoint installs schema admission on request.Endpoint. exchange -> prepare
+//// validates timers, standard mirrors and custom header plans before native.open.
+//// The managed task adopts the Gun pid before send -> receive_headers chooses JSON
+//// or SSE. receive_json -> final_json and receive_sse -> messages accept only the
+//// correlated response; SSE notifications first pass their notification policy.
+////
+//// listen retains the same prepared task in a detached scope. poll observes that
+//// scope and cancel -> join drains it. The handle owns its connection, so a caller
+//// must keep it until completion or cancellation. Body credit is renewed only after
+//// consumption; this bounds queued native messages, not total stream lifetime.
 
 import gleam/bit_array
 import gleam/int
@@ -23,13 +36,21 @@ import weft
 
 /// A validated HTTP endpoint and caller-owned authentication headers.
 pub opaque type Config {
+  /// The settings admitted together before any transport effect.
   Config(
+    /// The original absolute URL used as endpoint identity.
     url: String,
+    /// The parsed host used for connection and TLS hostname verification.
     host: String,
+    /// The admitted TCP port, including the scheme default when omitted.
     port: Int,
+    /// The admitted http or https transport choice.
     scheme: String,
+    /// The request path with its optional query string.
     path: String,
+    /// The caller's authentication headers, checked against reserved transport names.
     headers: List(#(String, String)),
+    /// The byte cap for one JSON response or SSE event.
     limit: Int,
   )
 }
@@ -153,6 +174,8 @@ pub fn exchange(
   }
 }
 
+// All envelope and mirror checks finish before this prepared task exists.
+// The callback then owns exactly one Gun connection under the scope's ledger.
 fn prepare(
   config: Config,
   outbound: request.Outbound,
@@ -224,7 +247,11 @@ fn prepare(
 
 /// The retained scope of one HTTP subscription, owning its worker and socket.
 pub opaque type Listening {
-  Listening(run: weft.Detached(JsonValue, request.Error))
+  /// The retained scope whose outcome and retirement must be consumed.
+  Listening(
+    /// The retained request scope that owns its worker and Gun connection.
+    run: weft.Detached(JsonValue, request.Error),
+  )
 }
 
 /// The observed lifetime of a retained subscription.
@@ -305,6 +332,8 @@ pub fn cancel(listening: Listening) -> Result(Nil, request.Error) {
   join(listening.run)
 }
 
+// Drain consumes outcomes until the scope reports AllDelivered. A terminal
+// value and worker retirement are separate observations.
 fn join(
   run: weft.Detached(JsonValue, request.Error),
 ) -> Result(Nil, request.Error) {
@@ -316,6 +345,8 @@ fn join(
   }
 }
 
+// This is the first network effect after adoption. All subsequent receives
+// use the same absolute deadline; none restarts the caller's budget.
 fn send(
   config: Config,
   outbound: request.Outbound,
@@ -342,6 +373,9 @@ fn remaining(deadline: Int) -> Int {
   int.max(0, deadline - native.now())
 }
 
+// Informational responses leave the same request outstanding. Status and
+// media type decide how body bytes are interpreted, while final correlation
+// remains mandatory even for a JSON error body.
 fn receive_headers(
   config: Config,
   outbound: request.Outbound,
@@ -405,6 +439,8 @@ fn receive_headers(
   }
 }
 
+// Body credit is renewed after the byte cap has been checked and the fragment
+// consumed. The pending bytes belong only to this one response.
 fn receive_json(
   config: Config,
   connection,
@@ -466,6 +502,8 @@ fn final_json(bytes, id, policy) {
   }
 }
 
+// Complete events are validated before observer delivery. A stream end without
+// a correlated final result leaves the remote execution outcome unknown.
 fn receive_sse(
   outbound: request.Outbound,
   connection,
@@ -556,6 +594,8 @@ fn notification_policy(
   }
 }
 
+// Events from one fragment remain ordered. Once a final response is admitted,
+// any following event in that fragment is a protocol refusal.
 fn messages(
   events: List(String),
   id: jsonrpc.Id,

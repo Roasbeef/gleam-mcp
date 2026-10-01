@@ -1,22 +1,21 @@
-//// The Model Context Protocol messages the tools-only client needs, and
-//// nothing more: the initialize lifecycle, `tools/list`, `tools/call`,
-//// and `ping`, targeting MCP revision 2025-06-18 (the initialize-based
-//// lifecycle) over the `gleam_mcp/jsonrpc` envelope.
+//// Wire shapes for tools and the legacy initialize lifecycle.
 ////
-//// Deliberately absent — not deferred by accident, refused for v1:
-//// resources, prompts, logging, sampling, roots, elicitation, progress,
-//// cancellation, completion, `listChanged` handling, and the 2026-07-28
-//// stateless mode. Every omitted feature is surface a hostile server
-//// could push data through; a tool-calling client needs none of it.
+//// ## Flow
 ////
-//// Builders here return the full JSON-RPC message value, ready for
-//// `gleam_mcp/stdio.frame`; decoders take the raw `result` value the
-//// `gleam_mcp/jsonrpc` layer already extracted from a `Response`. Every
-//// decoder is total: a lying server settles as a `ProtocolFault` value,
-//// never a crash. The boundary posture is explicit: required
-//// discriminators are strict, unknown extra fields inside known shapes
-//// are ignored, and payloads this slice does not interpret (tool input
-//// schemas, structured content) are carried raw.
+//// initialize_request_with_name -> decode_initialize_result checks the negotiated
+//// legacy revision and optional tools capability; initialized closes that handshake.
+//// list_tools_request -> decode_tools_page validates descriptors and pagination.
+//// call_tool_request -> decode_call_tool_result validates content and preserves
+//// structured output. JSON-RPC envelope checks remain in jsonrpc.
+////
+//// These builders are legacy-shaped. The modern client builds per-request metadata
+//// and resultType in client, metadata and discovery, while reusing descriptor and
+//// tool-result decoders here. Modern HTTP and explicit continuation support live
+//// in their own modules; this module's requested_version selects legacy startup.
+////
+//// Raw schemas and structuredContent are carried as JsonValue. Typed applications
+//// use tool.Tool and codec.Codec to validate them. Other content blocks preserve
+//// the complete raw payload so the host owns display and reduction policy.
 
 import gleam/int
 import gleam/list
@@ -49,11 +48,19 @@ pub fn supported_versions() -> List(String) {
 pub type ProtocolFault {
   /// The server negotiated a protocol revision this client cannot speak.
   /// Carries both sides so the refusal can be worded without re-asking.
-  UnsupportedVersion(server: String, supported: List(String))
+  UnsupportedVersion(
+    /// The unsupported initialized-session revision returned by the peer.
+    server: String,
+    /// The legacy contracts the handshake can admit.
+    supported: List(String),
+  )
 
   /// The result is not the shape the method promises; `reason` names the
   /// field (and, inside a list, the index) that broke it.
-  BadResult(reason: String)
+  BadResult(
+    /// The result field or contract that failed.
+    reason: String,
+  )
 }
 
 // --- initialize ------------------------------------------------------------
@@ -61,10 +68,14 @@ pub type ProtocolFault {
 /// What the server declared about its tools in `initialize`: presence
 /// means the server serves `tools/list` and `tools/call`; `list_changed`
 /// is whether it will emit `notifications/tools/list_changed`. Decoded
-/// faithfully, but v1 ignores `list_changed` — this client lists once per
-/// connection and never subscribes.
+/// faithfully for initialized-session clients. Modern subscription admission
+/// uses `subscription.Stream` and request metadata rather than this flag.
 pub type ToolsCapability {
-  ToolsCapability(list_changed: Bool)
+  /// The decoded legacy tools advertisement, before host admission.
+  ToolsCapability(
+    /// The raw legacy listChanged wire flag; no subscription is installed here.
+    list_changed: Bool,
+  )
 }
 
 /// A decoded `initialize` result.
@@ -76,25 +87,30 @@ pub type ToolsCapability {
 /// is carried verbatim when present; whether to show it to a model is a
 /// downstream trust decision, not this layer's.
 pub type InitializeResult {
+  /// The admitted initialize response for a legacy profile.
   InitializeResult(
+    /// The negotiated legacy contract, checked before returning the result.
     protocol_version: String,
+    /// The optional declared legacy tools capability.
     tools: Option(ToolsCapability),
+    /// Optional untrusted server identity for diagnostics.
     server_name: Option(String),
+    /// Optional untrusted server release string.
     server_version: Option(String),
+    /// Optional server guidance; receipt does not confer trust.
     instructions: Option(String),
   )
 }
 
-/// Builds the `initialize` request that opens every MCP connection.
+/// Builds the `initialize` request that opens a legacy MCP session.
 /// `client_version` is the caller's version, carried in `clientInfo`.
 ///
 /// The declared capabilities object is **deliberately empty**: this
 /// client never declares `sampling` (a server must not be able to spend
-/// our model), `roots` (a server learns nothing about the filesystem),
-/// or `elicitation` (a server must not be able to put questions to a
-/// human through us). That is a security decision from issue #106, not
-/// an unfinished list — adding a capability here widens what every
-/// connected server may ask of the harness.
+/// the host model), `roots` (a server receives no filesystem advertisement),
+/// or `elicitation` (a server cannot initiate questions through this profile).
+/// Adding a capability here would widen what every initialized-session peer
+/// can ask the host to do; modern input requests use their separate MRTR contract.
 ///
 /// ## Examples
 ///
@@ -140,7 +156,7 @@ pub fn initialize_request_with_name(
 /// Decodes an `initialize` result. Total. The negotiated version must be
 /// a member of `supported_versions`; `serverInfo` and `instructions` are
 /// tolerated absent; the capabilities object is reduced to the one
-/// question v1 asks of it — does the server declare tools, and did it
+/// legacy tools questions — does the server declare tools, and did it
 /// promise list-changed notifications.
 ///
 /// ## Examples
@@ -243,11 +259,17 @@ pub fn initialized() -> JsonValue {
 /// **raw**: deep JSON-Schema interpretation is the caller's job, and
 /// this layer neither validates nor normalizes them.
 pub type ToolDescriptor {
+  /// The discovery record, preserving raw schemas and descriptive data.
   ToolDescriptor(
+    /// The peer's wire tool name; typed registration validates names separately.
     name: String,
+    /// Optional peer-authored display title.
     title: Option(String),
+    /// Optional peer-authored tool guidance.
     description: Option(String),
+    /// Raw input schema; schema.new must admit it before typed validation.
     input_schema: JsonValue,
+    /// Optional raw output schema, without implied compilation.
     output_schema: Option(JsonValue),
   )
 }
@@ -255,7 +277,13 @@ pub type ToolDescriptor {
 /// One page of a `tools/list` result. `next_cursor` present means the
 /// server has more; feed it back into `list_tools_request`.
 pub type ToolsPage {
-  ToolsPage(tools: List(ToolDescriptor), next_cursor: Option(String))
+  /// The current descriptors and optional next-page token.
+  ToolsPage(
+    /// The optional declared legacy tools capability.
+    tools: List(ToolDescriptor),
+    /// Opaque pagination token, reused only for the next list attempt.
+    next_cursor: Option(String),
+  )
 }
 
 /// Builds a `tools/list` request. `cursor` continues a paginated listing;
@@ -349,16 +377,24 @@ fn decode_tool(
 
 // --- tools/call ------------------------------------------------------------
 
-/// One block of a tool result's content. v1 keeps text and drops every
-/// other payload verbatim so the caller can apply its own content policy.
+/// One block of a tool result's content. Text is separated for the caller;
+/// every other payload is preserved for the caller's content policy.
 /// The kind remains explicit while unknown block fields stay intact.
 pub type ContentBlock {
   /// A `{type: "text"}` block's text, verbatim and untrusted.
-  Text(text: String)
+  Text(
+    /// Verbatim untrusted text content.
+    text: String,
+  )
 
   /// Any other block kind (`image`, `audio`, `resource`, ...): the type
   /// name alone, payload preserved verbatim.
-  Other(kind: String, raw: JsonValue)
+  Other(
+    /// The content discriminator the host must interpret.
+    kind: String,
+    /// The entire non-text content object, preserving fields for the host.
+    raw: JsonValue,
+  )
 }
 
 /// A decoded `tools/call` result.
@@ -368,9 +404,13 @@ pub type ContentBlock {
 /// meant to see, distinct from a JSON-RPC error, which `gleam_mcp/jsonrpc`
 /// already settled. `structured_content` is carried raw when present.
 pub type CallToolResult {
+  /// The tool verdict, separate from a protocol error.
   CallToolResult(
+    /// The ordered content blocks, preserving unknown non-text payloads.
     content: List(ContentBlock),
+    /// The wire isError flag, defaulted to False when absent.
     is_error: Bool,
+    /// Optional raw output; a typed call validates it through its bound codec.
     structured_content: Option(JsonValue),
   )
 }

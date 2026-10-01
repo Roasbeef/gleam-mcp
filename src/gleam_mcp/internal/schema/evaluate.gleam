@@ -2,6 +2,24 @@
 //// Coverage belongs to the current instance location; child-value coverage never
 //// leaks to its parent. Failed branches discard annotations but retain their work
 //// charge, so alternatives cannot reset the evaluator's finite allowance.
+////
+//// ## Flow
+////
+//// validate bounds the complete instance, then eval charges a node visit and
+//// tracks dynamic resource scope. evaluate_object charges structural comparison
+//// work; evaluate_keywords runs assertions, references, composition, conditional,
+//// object_keywords, array_keywords and finally unevaluated in that order.
+////
+//// Coverage stores names and indices at the current instance location. A parent
+//// records its child's location after successful validation, rather than importing
+//// the child's nested coverage. Applicators on the same instance can merge coverage
+//// before unevaluatedProperties or unevaluatedItems checks the remaining locations.
+////
+//// Evaluated carries remaining even on Error. combine_branches and contains_item
+//// retain failed branches' charges and propagate Limit instead of treating it as
+//// a mismatch. This matters for anyOf and not: budget exhaustion can't become a
+//// successful alternative or negated assertion. Context record updates are fresh
+//// values, so a child scope/path doesn't overwrite its parent's values.
 
 import gleam/dict.{type Dict}
 import gleam/int
@@ -18,7 +36,12 @@ import gleam_mcp/json.{type JsonValue}
 /// An assertion refusal or an exhausted evaluation allowance.
 pub type Error {
   /// The path and failed keyword, without echoing instance data.
-  Mismatch(path: String, reason: String)
+  Mismatch(
+    /// The JSON pointer to the current instance location.
+    path: String,
+    /// The failed assertion, without the rejected instance value.
+    reason: String,
+  )
 
   /// Recursion or structural comparisons exhausted the evaluation allowance.
   Limit
@@ -79,6 +102,9 @@ fn refused(context: Context, keyword: String) -> Evaluated {
   )
 }
 
+// Each visit spends allowance before inspecting the schema. Dynamic scope
+// records active resources, while immutable Context updates keep child paths
+// and recursion depth local to that evaluation.
 fn eval(node: Node, instance: JsonValue, context: Context) -> Evaluated {
   let scope = case list.contains(context.scope, node.base) {
     True -> context.scope
@@ -446,6 +472,9 @@ fn composition(
   )
 }
 
+// Every branch receives the previous branch's remaining allowance, including
+// branches that mismatch. Only successful branch coverage is merged; a Limit
+// never counts as a nonmatch that could make not or an alternative succeed.
 fn combine_branches(
   node: Node,
   instance: JsonValue,
@@ -515,6 +544,8 @@ fn combine_branches(
   }
 }
 
+// The condition selects a branch and spends work even when it mismatches.
+// Only a successful condition can contribute its coverage to the same instance.
 fn conditional(
   node: Node,
   instance: JsonValue,
@@ -666,6 +697,8 @@ fn member_schemas(node: Node, name: String) -> List(Node) {
   }
 }
 
+// Children here validate the same instance location, so successful coverage
+// can be merged. Property and item traversal records the parent's member instead.
 fn evaluate_children(
   checks: List(#(Node, JsonValue)),
   context: Context,
@@ -854,6 +887,8 @@ fn check_contains_count(
   }
 }
 
+// Run after adjacent applicators so their successful annotations are already
+// visible. This final pass checks only still-uncovered names or indices.
 fn unevaluated(
   node: Node,
   instance: JsonValue,
@@ -953,6 +988,9 @@ fn unevaluated_items(
   }
 }
 
+// Structural comparisons can inspect an entire instance rather than one
+// schema node. Charge a conservative weight before executing those assertions;
+// this logical charge still cannot time-bound the native regex engine.
 fn assertion_cost(schema: JsonValue, instance: JsonValue) -> Int {
   let weight = case document.bounded(instance, 0, 100_000) {
     Ok(remaining) -> 100_000 - remaining

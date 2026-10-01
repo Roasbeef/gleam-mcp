@@ -2,6 +2,13 @@
 //// Neither stdlib nor gleam_erlang can decode the opaque native socket term.
 //// This single adapter compares socket identity and classifies lifecycle events;
 //// actor selection, cancellation and worker custody remain in Gleam and weft.
+////
+//// ## Flow
+////
+//// classify compares the exact Mist socket in TCP/TLS close, error and data
+//// messages. server_http selects these messages alongside weft scope outcomes;
+//// Closed and UnexpectedData request cancellation, while Unrelated preserves the
+//// stream. Classification has no authority to cancel or stop a process itself.
 
 import gleam/dynamic.{type Dynamic}
 import glisten/socket.{type Socket}

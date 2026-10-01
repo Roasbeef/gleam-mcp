@@ -4,6 +4,38 @@
 //// decoding and initialize ordering; each handler owns its argument decoder and
 //// effects. `handle_line` is the deterministic seam when handlers are pure, while
 //// `server_stdio.run` connects the same transitions to bounded native input.
+////
+//// ## Flow
+////
+//// Typed registration follows bind -> bind_round_trip. The bound closure decodes
+//// arguments before calling the application, then checks encoded output with the
+//// request-bound result codec. new -> unique_tools refuses duplicate wire names.
+//// Raw tool registration only checks the root schema shape, so its handler owns
+//// argument decoding; modern dispatch additionally compiles and validates input.
+////
+//// handle_line -> json.parse -> handle_message -> jsonrpc.decode_value distinguishes control
+//// messages from requests. Modern requests follow handle_modern -> modern_metadata
+//// -> modern_method -> modern_call_tool -> checked_output or required_result.
+//// Legacy requests follow handle_request -> initialize, list_tools or call_tool.
+//// The transport runs this dispatch inside its own admitted handler lifetime.
+////
+//// ## Registry transitions
+////
+//// | Phase | Input | Next state |
+//// | --- | --- | --- |
+//// | AwaitingInitialize | Valid initialize | AwaitingInitialized. |
+//// | AwaitingInitialized | notifications/initialized | Ready. |
+//// | Ready | tools/list or tools/call | Ready with the same registry. |
+//// | Any | modern(registry) | RequestsOnly; explicit lifecycle selection. |
+//// | Any | Modern request metadata | Request-scoped dispatch; phase unchanged. |
+//// | RequestsOnly | subscriptions/listen | Retain a unique subscription id. |
+////
+//// Modern metadata is validated per request. A suspension ends its attempt and
+//// returns input_required; the registry stores no trusted continuation state.
+//// Notifications can retire subscription ids, but never execute tool handlers.
+//// An immutable catalog acknowledges an empty source set because it has no change
+//// producer. A tool-level failure remains a successful JSON-RPC envelope with
+//// isError; malformed requests and unknown names remain protocol errors.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -23,10 +55,16 @@ import gleam_mcp/version as revision
 /// A handler's refusal, kept distinct from a tool that ran and failed.
 pub type ToolError {
   /// Arguments failed the tool's total decoder before execution.
-  InvalidArguments(reason: String)
+  InvalidArguments(
+    /// The rejected argument contract or execution diagnostic.
+    reason: String,
+  )
 
   /// Execution failed and the client should receive a tool-level verdict.
-  ExecutionFailed(reason: String)
+  ExecutionFailed(
+    /// The rejected argument contract or execution diagnostic.
+    reason: String,
+  )
 }
 
 /// Why a server or tool definition could not be registered.
@@ -35,7 +73,10 @@ pub type ConfigurationError {
   EmptyName
 
   /// Two registered tools had the same wire name.
-  DuplicateTool(name: String)
+  DuplicateTool(
+    /// The duplicate wire name that prevents registry construction.
+    name: String,
+  )
 
   /// A schema did not declare an object at its top level.
   InvalidSchema
@@ -43,6 +84,7 @@ pub type ConfigurationError {
 
 /// A validated tool descriptor and its caller-owned handler.
 pub opaque type Tool {
+  /// The admitted tool definition and callbacks retained as one value.
   Tool(
     /// The descriptor admitted before the server starts.
     descriptor: protocol.ToolDescriptor,
@@ -58,10 +100,16 @@ pub opaque type Tool {
 /// A typed handler either completes or explicitly asks the caller for input.
 pub type ToolStep(output) {
   /// Validated output completes this request.
-  Complete(output: output)
+  Complete(
+    /// The typed handler output, still checked before wire completion.
+    output: output,
+  )
 
   /// Opaque request state and input requests suspend this request.
-  InputRequired(required: mrtr.Required)
+  InputRequired(
+    /// The admitted suspension, leaving provider execution with the caller.
+    required: mrtr.Required,
+  )
 }
 
 type RawStep {
@@ -78,6 +126,7 @@ type Phase {
 
 /// A server whose registered tool names are unique.
 pub opaque type Server {
+  /// The immutable registry and its protocol state.
   Server(
     /// The identity advertised by initialize.
     name: String,
@@ -85,7 +134,7 @@ pub opaque type Server {
     version: String,
     /// Registered tools whose names are unique.
     tools: List(Tool),
-    /// The only lifecycle transition that admits tools/call.
+    /// The legacy session phase or explicit modern-profile selection.
     phase: Phase,
     /// Subscriptions acknowledged on this stdio channel.
     subscriptions: List(jsonrpc.Id),
@@ -159,7 +208,8 @@ pub fn with_output_schema(
 /// ## Examples
 ///
 /// ```gleam
-/// // server.new("jev", "0.1.0", tools)
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert !server.is_modern(registry)
 /// ```
 pub fn new(
   name: String,
@@ -184,7 +234,8 @@ pub fn new(
 /// ## Examples
 ///
 /// ```gleam
-/// // server.is_modern(server.modern(registry)) returns True.
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert server.is_modern(server.modern(registry))
 /// ```
 pub fn is_modern(server: Server) -> Bool {
   server.phase == RequestsOnly
@@ -195,7 +246,8 @@ pub fn is_modern(server: Server) -> Bool {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.subscriptions(registry) is empty before any listen request.
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert server.subscriptions(registry) == []
 /// ```
 pub fn subscriptions(server: Server) -> List(jsonrpc.Id) {
   server.subscriptions
@@ -231,6 +283,10 @@ pub fn bind_round_trip(
   definition: definition.Tool(args, output),
   handler: fn(args, mrtr.Context) -> Result(ToolStep(output), ToolError),
 ) -> Result(Tool, ConfigurationError) {
+  // The closure preserves the original definition at the effect boundary.
+  // Successful output must pass both the schema and the decoder bound to these
+  // arguments before the server can publish a completion.
+
   let round_trip = fn(raw, context) {
     use args <- result.try(
       definition.decode_arguments(definition, raw)
@@ -278,7 +334,8 @@ pub fn bind_round_trip(
 /// ## Examples
 ///
 /// ```gleam
-/// // server.modern(server) is the default HTTP server boundary.
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert server.modern(registry) |> server.is_modern
 /// ```
 pub fn modern(server: Server) -> Server {
   Server(..server, phase: RequestsOnly)
@@ -289,7 +346,9 @@ pub fn modern(server: Server) -> Server {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.with_cache_hint(server, hint)
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// let same = server.with_cache_hint(registry, discovery.stale())
+/// assert server.subscriptions(same) == []
 /// ```
 pub fn with_cache_hint(server: Server, hint: discovery.CacheHint) -> Server {
   Server(..server, cache: hint)
@@ -300,7 +359,8 @@ pub fn with_cache_hint(server: Server, hint: discovery.CacheHint) -> Server {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.tool_input_schema(server, "echo") precedes HTTP header validation.
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert server.tool_input_schema(registry, "missing") == None
 /// ```
 pub fn tool_input_schema(
   server: Server,
@@ -355,7 +415,11 @@ fn unique_tools(
 /// ## Examples
 ///
 /// ```gleam
-/// // server.object_schema([#("query", json.Object([#("type", json.String("string"))]))], ["query"])
+/// assert server.object_schema([], []) == json.Object([
+///   #("type", json.String("object")),
+///   #("properties", json.Object([])),
+///   #("required", json.Array([])),
+/// ])
 /// ```
 pub fn object_schema(
   properties: List(#(String, JsonValue)),
@@ -412,7 +476,9 @@ pub fn argument(
 /// ## Examples
 ///
 /// ```gleam
-/// // server.structured(json.Object([#("answer", json.Bool(True))]))
+/// let value = json.Object([#("answer", json.Bool(True))])
+/// assert server.structured(value).structured_content == Some(value)
+/// assert !server.structured(value).is_error
 /// ```
 pub fn structured(value: JsonValue) -> protocol.CallToolResult {
   protocol.CallToolResult(
@@ -427,7 +493,8 @@ pub fn structured(value: JsonValue) -> protocol.CallToolResult {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.text("Done.")
+/// assert server.text("Done.").content == [protocol.Text("Done.")]
+/// assert server.text("Done.").structured_content == None
 /// ```
 pub fn text(message: String) -> protocol.CallToolResult {
   protocol.CallToolResult(
@@ -442,7 +509,7 @@ pub fn text(message: String) -> protocol.CallToolResult {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.failure("The upstream service is unavailable.")
+/// assert server.failure("upstream unavailable").is_error
 /// ```
 pub fn failure(message: String) -> protocol.CallToolResult {
   protocol.CallToolResult(..text(message), is_error: True)
@@ -486,6 +553,9 @@ pub fn handle_message(
   server: Server,
   value: JsonValue,
 ) -> #(Server, Option(JsonValue)) {
+  // Control traffic updates only registry lifecycle or subscription identities.
+  // Tool effects enter through request dispatch after profile-specific admission.
+
   case jsonrpc.decode_value(value) {
     Error(_) -> #(
       server,
@@ -554,7 +624,8 @@ fn has_metadata(params: Option(JsonValue)) -> Bool {
 /// ## Examples
 ///
 /// ```gleam
-/// // server.close_subscriptions(server) returns final correlated complete results.
+/// let assert Ok(registry) = server.new("catalog", "1", [])
+/// assert server.close_subscriptions(registry) == #(registry, [])
 /// ```
 pub fn close_subscriptions(server: Server) -> List(JsonValue) {
   list.map(server.subscriptions, subscription.closed)
@@ -666,6 +737,8 @@ fn capabilities(server: Server) -> JsonValue {
   }
 }
 
+// The immutable registry can retain a live subscription id while accepting
+// an empty source set. It has no tool-list change producer to advertise.
 fn listen(
   server: Server,
   id: jsonrpc.Id,
@@ -695,6 +768,8 @@ fn listen(
   }
 }
 
+// Envelope and name errors remain protocol errors. Once a known tool has
+// arguments, its validation or execution refusal becomes the visible tool verdict.
 fn modern_call_tool(
   server: Server,
   id: jsonrpc.Id,
@@ -732,6 +807,9 @@ fn modern_call_tool(
   }
 }
 
+// A failed tool verdict carries diagnostics rather than successful output.
+// Only successful values with a declared output schema need structuredContent
+// and schema admission here.
 fn checked_output(tool: Tool, answer: protocol.CallToolResult) -> JsonValue {
   case tool.descriptor.output_schema, answer.is_error {
     None, _ | _, True -> result_json(answer)
@@ -1063,6 +1141,8 @@ fn error_response(
   ])
 }
 
+// A suspension terminates this attempt. Client-declared provider capabilities
+// are checked before returning input requests, but no provider executes here.
 fn required_result(
   registry: Server,
   id: jsonrpc.Id,

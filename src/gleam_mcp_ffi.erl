@@ -1,12 +1,17 @@
-%% Erlang shims for the mcp package (house rule: one flat FFI module per
-%% package; every function here is reached only through the Gleam
-%% externals in gleam_mcp/internal/ffi_port.gleam).
+%% Native stdio calls unavailable through the Gleam process and port APIs.
+%% The Gleam ffi_port and ffi_stdio modules expose typed wrappers; client and
+%% server_stdio retain policy, selection and retirement custody.
 %%
-%% Each shim converts to Gleam conventions at the boundary: exceptions
-%% are caught and returned as {ok, X} | {error, Reason} — nil where the
-%% caller can do nothing with a reason, a short lowercase binary where it
-%% can — and raw terms are normalized into the tuple shapes of the Gleam
-%% types declared on the other side of the external.
+%% Flow: open_stdio opens a direct child; port_send submits bytes; port_event
+%% classifies a received native term after the Gleam selector checks its port.
+%% port_os_pid and kill_os_process initiate termination, while exit_status is
+%% the separate evidence consumed by the client owner. No call joins descendants.
+%% stdio_read_line starts bounded lookahead, stdio_collect_line completes it,
+%% and stdio_write reports output refusal without mixing stderr into the wire.
+%%
+%% Shims normalize native exceptions into Gleam Result tuples. Signaling and
+%% pid lookup cannot atomically prove which process has exited; the original
+%% port's exit_status remains authoritative for direct-child retirement.
 -module(gleam_mcp_ffi).
 
 -export([

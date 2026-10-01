@@ -4,6 +4,13 @@
 //// gleam_erlang, gleam_otp nor weft exposes a bounded stdin line reader.
 //// The shim uses OTP's get_until protocol to stop at a newline or byte cap
 //// before constructing a complete String; it starts no process or timer.
+////
+//// ## Flow
+////
+//// read_line invokes the bounded OTP get_until callback in gleam_mcp_ffi.erl.
+//// The IO server retains unread bytes after the newline; the shim validates UTF-8
+//// before constructing a Gleam String. write normalizes OTP output failures into
+//// Results. server_stdio owns the reader/writer tasks and their drain ordering.
 
 import gleam/option.{type Option}
 

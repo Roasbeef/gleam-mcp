@@ -1,31 +1,25 @@
-//// The transport seam between the MCP client actor and its server
-//// process: send a framed line out, receive raw bytes and the close as
-//// messages, tear the peer down.
+//// The native stdio seam keeps spawning policy with the application.
 ////
-//// The seam is deliberate. `gleam_mcp/client` is written against `Transport`
-//// alone, so the decision of *how* a server process comes to exist —
-//// and in particular whether it is spawned inside a jail through the
-//// `loom-exec` helper — can change without rewriting the actor.
-//// `PortTransport` is the mechanism: a child OS process on an Erlang
-//// port, stdin/stdout as the wire. **Who gets to spawn a real server
-//// binary is the harness wiring's decision, made elsewhere**; an
-//// unjailed spawn here is the production primitive, not the final
-//// security posture. Whether an MCP server should run inside a jail at
-//// all is an open decision rather than a deferred implementation — it
-//// is recorded as such in `docs/next.md`, and this seam is where the
-//// answer would attach.
+//// PortTransport opens an executable with argv, environment overrides and an
+//// optional directory. It doesn't install a jail. The host chooses executables
+//// and their isolation policy. Stderr stays separate from protocol stdout.
+//// ChannelTransport supplies the same data/close events for in-process peers.
 ////
-//// The child's stderr is deliberately **not** merged into stdout:
-//// `stderr_to_stdout` would interleave the server's diagnostics into
-//// the newline-delimited JSON-RPC stream and corrupt framing. Instead
-//// stderr is inherited from the BEAM, so server diagnostics land on the
-//// harness's own stderr; capturing them is later work.
+//// ## Flow
 ////
-//// The other variant, `ChannelTransport`, is the test seam: an
-//// in-process peer receives the connect, sees every outbound line, and
-//// delivers inbound bytes and the close through the same messages the
-//// port does — so every client behaviour is provable without an OS
-//// process.
+//// spawn and its setters describe the future child. open -> ffi_port.open_stdio
+//// runs in the client owner and installs that port's selector. The returned send
+//// callback writes framed lines; close looks up the current child pid and requests
+//// SIGKILL while retaining the port for native exit_status. port_transport_event
+//// normalizes byte and close events for client.handle.
+////
+//// utf8_prefix -> split_holding -> held_tail admits complete text and at most three
+//// bytes of a plausible incomplete code point. Invalid input is refused before
+//// stdio line framing. The host must retain the connection after close until its
+//// TransportClosed event; signaling alone isn't termination evidence.
+////
+//// The kill policy covers the direct child. PID lookup and signaling are not atomic,
+//// and neither descendant cleanup nor external effect rollback is established.
 
 import gleam/bit_array
 import gleam/bool
@@ -45,10 +39,15 @@ import gleam_mcp/internal/ffi_port
 /// own environment (the `api_key_env` indirection) is harness wiring's
 /// job, not this record's.
 pub type Spawn {
+  /// The caller-selected executable and its process environment.
   Spawn(
+    /// The host-selected executable path, passed as argv rather than shell text.
     executable: String,
+    /// The argument vector passed to that executable.
     args: List(String),
+    /// Environment overrides applied when the child is spawned.
     env: List(#(String, String)),
+    /// The optional child working directory.
     directory: Option(String),
   )
 }
@@ -94,11 +93,17 @@ pub fn in_directory(spawn: Spawn, directory: String) -> Spawn {
 pub type TransportEvent {
   /// A chunk of the server's stdout: raw bytes at whatever boundary the
   /// pipe (or a test peer) delivered — not yet lines, not yet UTF-8.
-  TransportData(bytes: BitArray)
+  TransportData(
+    /// Unframed stdout bytes, possibly splitting a UTF-8 code point.
+    bytes: BitArray,
+  )
 
   /// The wire is gone: the server exited, or a test peer closed it. No
   /// event follows this one.
-  TransportClosed(reason: String)
+  TransportClosed(
+    /// The close diagnostic or native direct-child exit status.
+    reason: String,
+  )
 }
 
 /// The open half of the seam: write one framed line, and tear the peer
@@ -122,7 +127,13 @@ pub type TransportEvent {
 /// would be an FFI shim that half-closes the child's stdin, which
 /// `erlang:open_port/2` has no supported way to do.
 pub type Connection {
-  Connection(send: fn(String) -> Result(Nil, Nil), close: fn() -> Nil)
+  /// The callbacks that own writes and termination requests for one peer.
+  Connection(
+    /// Writes one framed line; a failure means the peer cannot receive it.
+    send: fn(String) -> Result(Nil, Nil),
+    /// Requests termination; callers still wait for TransportClosed evidence.
+    close: fn() -> Nil,
+  )
 }
 
 /// How the client actor reaches its MCP server. A seam: production
@@ -132,13 +143,19 @@ pub type Transport {
   /// A real child process, spawned as an Erlang port owned by the actor
   /// (ports deliver their messages to the process that opened them,
   /// which is why this is a spawn spec rather than an open port).
-  PortTransport(spawn: Spawn)
+  PortTransport(
+    /// The future child description, opened inside its owning actor.
+    spawn: Spawn,
+  )
 
   /// An in-process peer. `connect` runs in the actor's process during
   /// startup: it receives the subject on which the actor takes inbound
   /// `TransportEvent`s and returns the connection the actor will write
   /// through.
-  ChannelTransport(connect: fn(Subject(TransportEvent)) -> Connection)
+  ChannelTransport(
+    /// The caller-owned in-process peer constructor, with the actor's inbound channel.
+    connect: fn(Subject(TransportEvent)) -> Connection,
+  )
 }
 
 /// Opens a transport from inside the client actor's own process,

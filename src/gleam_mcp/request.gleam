@@ -1,6 +1,18 @@
 //// An endpoint binds request effects to one caller-owned transport.
 //// Typed tools hand the transport their compiled input schema, allowing HTTP
 //// binding validation before admission. This seam owns no process or socket.
+////
+//// ## Flow
+////
+//// options -> outbound carries one request's metadata, timer and observer.
+//// endpoint_with_admission binds exchange and schema policy together; client.call
+//// uses admit_schema before exchange. The endpoint invokes the supplied callback
+//// once and has no resource lifecycle of its own.
+////
+//// A function value can capture its transport configuration in Gleam. Retaining an
+//// Endpoint therefore retains that exact callback and configuration in a client
+//// continuation. Custom exchanges must enforce their own timer and cleanup contract;
+//// a timeout_ms field alone cannot stop external work.
 
 import gleam/int
 import gleam/option.{type Option}
@@ -13,20 +25,33 @@ import gleam_mcp/version.{type Version}
 /// A request refusal, preserving JSON-RPC error data without reducing it.
 pub type Error {
   /// The caller-owned transport could not complete the exchange.
-  TransportFailed(reason: String)
+  TransportFailed(
+    /// The failed contract or transport diagnostic.
+    reason: String,
+  )
 
   /// A correlated JSON-RPC error returned by the peer.
-  RpcFailed(error: jsonrpc.RpcError)
+  RpcFailed(
+    /// The peer's structured JSON-RPC refusal.
+    error: jsonrpc.RpcError,
+  )
 
   /// A successful envelope did not satisfy its bound result contract.
-  InvalidResponse(reason: String)
+  InvalidResponse(
+    /// The failed contract or transport diagnostic.
+    reason: String,
+  )
 
   /// Arguments or their transport binding failed before effects began.
-  InvalidArguments(reason: String)
+  InvalidArguments(
+    /// The failed contract or transport diagnostic.
+    reason: String,
+  )
 }
 
 /// The complete request passed to a caller-owned exchange function.
 pub type Outbound {
+  /// The complete exchange contract passed to the transport.
   Outbound(
     /// The JSON-RPC envelope, including revision-specific request metadata.
     envelope: JsonValue,
@@ -41,18 +66,26 @@ pub type Outbound {
 
 /// One transport and its schema-admission policy.
 pub opaque type Endpoint {
+  /// The exchange and schema admission policy retained under one identity.
   Endpoint(
+    /// The stable caller-selected label; it grants no transport authority.
     identifier: String,
+    /// The exact caller-owned callback invoked for one explicit exchange.
     exchange: fn(Outbound) -> Result(JsonValue, Error),
+    /// The schema policy run before a typed call can enter the exchange.
     admit: fn(Schema) -> Result(Nil, Error),
   )
 }
 
 /// Options bound to one request rather than inherited from a session.
 pub opaque type Options {
+  /// The request or startup settings used by this module.
   Options(
+    /// The request-scoped metadata, including descriptive client identity.
     meta: metadata.Metadata,
+    /// The clamped positive timer budget passed to the transport.
     timeout_ms: Int,
+    /// The observer for notifications admitted by the selected transport.
     on_notification: fn(JsonValue) -> Nil,
   )
 }
@@ -62,7 +95,8 @@ pub opaque type Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // request.endpoint("local", fn(outbound) { exchange(outbound.envelope) })
+/// let endpoint = request.endpoint("local", fn(outbound) { Ok(outbound.envelope) })
+/// assert request.identifier(endpoint) == "local"
 /// ```
 pub fn endpoint(
   identifier: String,
@@ -76,7 +110,12 @@ pub fn endpoint(
 /// ## Examples
 ///
 /// ```gleam
-/// // HTTP endpoints install their compiled x-mcp-header admission check here.
+/// let endpoint = request.endpoint_with_admission(
+///   "local", fn(outbound) { Ok(outbound.envelope) },
+///   fn(_) { Error(request.InvalidArguments("schema refused")) },
+/// )
+/// let assert Ok(input) = schema.new(json.Bool(True))
+/// assert request.admit_schema(endpoint, input) == Error(request.InvalidArguments("schema refused"))
 /// ```
 pub fn endpoint_with_admission(
   identifier: String,
@@ -91,7 +130,8 @@ pub fn endpoint_with_admission(
 /// ## Examples
 ///
 /// ```gleam
-/// // request.identifier(endpoint) returns its construction-time label.
+/// let endpoint = request.endpoint("local", fn(outbound) { Ok(outbound.envelope) })
+/// assert request.identifier(endpoint) == "local"
 /// ```
 pub fn identifier(endpoint: Endpoint) -> String {
   endpoint.identifier
@@ -102,7 +142,9 @@ pub fn identifier(endpoint: Endpoint) -> String {
 /// ## Examples
 ///
 /// ```gleam
-/// // request.admit_schema(endpoint, input_schema) precedes encoding a call.
+/// let endpoint = request.endpoint("local", fn(outbound) { Ok(outbound.envelope) })
+/// let assert Ok(input) = schema.new(json.Bool(True))
+/// assert request.admit_schema(endpoint, input) == Ok(Nil)
 /// ```
 pub fn admit_schema(endpoint: Endpoint, schema: Schema) -> Result(Nil, Error) {
   endpoint.admit(schema)
@@ -113,7 +155,9 @@ pub fn admit_schema(endpoint: Endpoint, schema: Schema) -> Result(Nil, Error) {
 /// ## Examples
 ///
 /// ```gleam
-/// // request.exchange(endpoint, outbound) returns a JSON-RPC response envelope.
+/// let endpoint = request.endpoint("local", fn(outbound) { Ok(outbound.envelope) })
+/// let outbound = request.outbound(request.options("agent", "1"), json.Null, None)
+/// assert request.exchange(endpoint, outbound) == Ok(json.Null)
 /// ```
 pub fn exchange(
   endpoint: Endpoint,
@@ -127,7 +171,7 @@ pub fn exchange(
 /// ## Examples
 ///
 /// ```gleam
-/// // request.options("agent", "1") uses revision 2026-07-28 and a 60s budget.
+/// assert request.timeout_ms(request.options("agent", "1")) == 60_000
 /// ```
 pub fn options(name: String, release: String) -> Options {
   Options(
@@ -142,7 +186,8 @@ pub fn options(name: String, release: String) -> Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // options |> request.with_version(version.V20250618)
+/// let options = request.options("agent", "1") |> request.with_version(version.V20250618)
+/// assert metadata.revision(request.metadata(options)) == version.V20250618
 /// ```
 pub fn with_version(options: Options, revision: Version) -> Options {
   let meta = metadata.with_revision(options.meta, revision)
@@ -156,7 +201,8 @@ pub fn with_version(options: Options, revision: Version) -> Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // options |> request.with_timeout(5000)
+/// let options = request.options("agent", "1") |> request.with_timeout(0)
+/// assert request.timeout_ms(options) == 1
 /// ```
 pub fn with_timeout(options: Options, milliseconds: Int) -> Options {
   Options(..options, timeout_ms: int.clamp(milliseconds, 1, 4_294_966_295))
@@ -167,7 +213,9 @@ pub fn with_timeout(options: Options, milliseconds: Int) -> Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // options |> request.with_notifications(fn(message) { observe(message) })
+/// let options = request.options("agent", "1")
+///   |> request.with_notifications(fn(_) { Nil })
+/// // -> The observer is attached to this request, not an inherited session.
 /// ```
 pub fn with_notifications(
   options: Options,
@@ -181,7 +229,7 @@ pub fn with_notifications(
 /// ## Examples
 ///
 /// ```gleam
-/// // request.metadata(options) supplies the params._meta object.
+/// assert metadata.revision(request.metadata(request.options("agent", "1"))) == version.V20260728
 /// ```
 pub fn metadata(options: Options) -> metadata.Metadata {
   options.meta
@@ -192,7 +240,7 @@ pub fn metadata(options: Options) -> metadata.Metadata {
 /// ## Examples
 ///
 /// ```gleam
-/// // request.timeout_ms(options) is shared across one catalog traversal.
+/// assert request.timeout_ms(request.options("agent", "1")) == 60_000
 /// ```
 pub fn timeout_ms(options: Options) -> Int {
   options.timeout_ms
@@ -203,7 +251,9 @@ pub fn timeout_ms(options: Options) -> Int {
 /// ## Examples
 ///
 /// ```gleam
-/// // request.outbound(options, envelope, None) builds a discovery exchange.
+/// let outbound = request.outbound(request.options("agent", "1"), json.Null, None)
+/// assert outbound.envelope == json.Null
+/// assert outbound.timeout_ms == 60_000
 /// ```
 pub fn outbound(
   options: Options,

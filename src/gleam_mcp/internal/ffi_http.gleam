@@ -2,6 +2,14 @@
 //// Neither stdlib, gleam_http, gleam_erlang, gleam_otp nor weft exposes native
 //// incremental HTTP response events. This adapter only translates native calls;
 //// deadlines, SSE framing, admission and connection custody stay in Gleam.
+////
+//// ## Flow
+////
+//// open returns Gun's pid without sending a POST. client_http adopts that pid,
+//// then post waits for connection establishment and starts one stream with one
+//// body-message credit. next translates native events; credit renews demand after
+//// consumption. close joins the actual Gun owner. now supplies monotonic elapsed
+//// time, so the Gleam caller can charge every wait to one absolute deadline.
 
 import gleam/erlang/process.{type Pid}
 
@@ -17,10 +25,17 @@ pub type Completion {
   Finished
 }
 
-/// A bounded native response event.
+/// One native response event; Gleam checks collection limits before retaining it.
 pub type Event {
   /// Metadata precedes body bytes.
-  Headers(completion: Completion, status: Int, headers: List(#(String, String)))
+  Headers(
+    /// The native marker indicating whether body events remain.
+    completion: Completion,
+    /// The HTTP status returned by Gun.
+    status: Int,
+    /// The native field list, including duplicates for later admission checks.
+    headers: List(#(String, String)),
+  )
 
   /// One flow-controlled body fragment.
   Data(

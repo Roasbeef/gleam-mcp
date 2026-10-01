@@ -17,6 +17,14 @@
 //// `FramingFault` value instead. The cap matches the cap channel's
 //// frame cap (16 MiB): both bound what one hostile peer message may
 //// cost the harness.
+////
+//// ## Flow
+////
+//// push checks chunks and folds complete lines into a bounded Buffer, retaining
+//// only the final incomplete line; checked_line handles CRLF before returning a
+//// message. frame -> json.to_string appends one newline on output. The client owns
+//// UTF-8 chunk repair before push, and the native server reader owns byte limits
+//// before constructing a line. This module performs no I/O.
 
 import gleam/bool
 import gleam/list
@@ -35,7 +43,12 @@ pub type FramingFault {
   /// A line exceeded `max_line_bytes`. `limit` restates the cap; `seen`
   /// is the byte count that breached it (for the pending line, the bytes
   /// buffered so far — the true line is at least that long).
-  LineTooLong(limit: Int, seen: Int)
+  LineTooLong(
+    /// The line byte ceiling that was exceeded.
+    limit: Int,
+    /// The bytes counted for the rejected complete or pending line.
+    seen: Int,
+  )
 }
 
 /// The accumulated partial line between pushes. Chunks are kept unjoined,
@@ -43,7 +56,13 @@ pub type FramingFault {
 /// carries — never a re-copy of everything buffered before it — and the
 /// cap check is one comparison rather than a walk.
 pub opaque type Buffer {
-  Buffer(pending: List(String), pending_bytes: Int)
+  /// The incomplete line and its charged byte count.
+  Buffer(
+    /// Incomplete line fragments in reverse arrival order.
+    pending: List(String),
+    /// The cached byte count used to check the cap before concatenating.
+    pending_bytes: Int,
+  )
 }
 
 /// An empty buffer: no partial line pending.

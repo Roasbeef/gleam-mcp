@@ -1,6 +1,17 @@
 //// HTTP metadata is a compiled property-path plan, never caller-selected values.
 //// Compiling a listing refuses annotations outside statically reachable object
 //// properties. Rendering and validating use the same plan before any effect.
+////
+//// ## Flow
+////
+//// compile -> walk -> annotation collects reachable properties, then unique
+//// rejects case-insensitive header collisions. headers -> at -> primitive renders
+//// values with encode_value. validate derives those same values and compares them
+//// with get -> decode_value, also refusing a header for a missing or null argument.
+////
+//// The plan retains property paths rather than user-selected header values. Schema
+//// branches, arrays and dynamic properties cannot supply an ambiguous mirror;
+//// annotations under those locations are refused during compilation.
 
 import gleam/bit_array
 import gleam/float
@@ -13,7 +24,11 @@ import gleam_mcp/json.{type JsonValue}
 
 /// A validated collection of primitive property paths.
 pub opaque type Plan {
-  Plan(entries: List(Entry))
+  /// The compiled mirror plan, constructed only after annotation admission.
+  Plan(
+    /// Unique header names tied to statically reachable primitive property paths.
+    entries: List(Entry),
+  )
 }
 
 type Primitive {
@@ -30,13 +45,17 @@ type Entry {
 ///
 /// ## Examples
 ///
-/// `compile(json.Object([]))` returns an empty plan.
+/// ```gleam
+/// assert http_headers.compile(json.Object([])) |> result.is_ok
+/// ```
 pub fn compile(schema: JsonValue) -> Result(Plan, String) {
   use entries <- result.try(walk(schema, [], []))
   use Nil <- result.try(unique(entries, []))
   Ok(Plan(entries))
 }
 
+// Only properties add a statically addressable argument path. Other branches
+// are inspected for forbidden annotations, not interpreted as header sources.
 fn walk(
   value: JsonValue,
   path: List(String),
@@ -67,6 +86,8 @@ fn walk(
   }
 }
 
+// A header binding must identify a non-root primitive with one static type.
+// Rejecting ambiguous bindings here keeps runtime mirroring deterministic.
 fn annotation(
   fields: List(#(String, JsonValue)),
   path: List(String),
@@ -120,7 +141,10 @@ fn unique(entries: List(Entry), seen: List(String)) -> Result(Nil, String) {
 ///
 /// ## Examples
 ///
-/// `valid_token("Tenant-Id")` is true.
+/// ```gleam
+/// assert http_headers.valid_token("Tenant-Id")
+/// assert !http_headers.valid_token("Tenant Id")
+/// ```
 pub fn valid_token(value: String) -> Bool {
   value != "" && token_bytes(<<value:utf8>>)
 }
@@ -150,7 +174,10 @@ fn token_bytes(bytes: BitArray) -> Bool {
 ///
 /// ## Examples
 ///
-/// `headers(plan, arguments)` derives `Mcp-Param-*` values from arguments.
+/// ```gleam
+/// let assert Ok(plan) = http_headers.compile(json.Object([]))
+/// assert http_headers.headers(plan, json.Object([])) == Ok([])
+/// ```
 pub fn headers(
   plan: Plan,
   arguments: JsonValue,
@@ -219,7 +246,9 @@ fn primitive(value: JsonValue, kind: Primitive) -> Result(String, String) {
 ///
 /// ## Examples
 ///
-/// `encode_value(" padded ")` returns `=?base64?IHBhZGRlZCA=?=`.
+/// ```gleam
+/// assert http_headers.encode_value("echo") == "echo"
+/// ```
 pub fn encode_value(value: String) -> String {
   case
     safe_ascii(<<value:utf8>>)
@@ -250,8 +279,13 @@ fn safe_ascii(bytes: BitArray) -> Bool {
 ///
 /// ## Examples
 ///
-/// `decode_value("=?base64?YQ==?=")` returns `Ok("a")`.
+/// ```gleam
+/// assert http_headers.decode_value(" echo ") == Ok("echo")
+/// ```
 pub fn decode_value(value: String) -> Result(String, String) {
+  // The sentinel is decoded only after raw header safety checks. Decoded UTF-8
+  // may contain characters that required Base64 on the wire.
+
   use Nil <- result.try(case safe_ascii(<<value:utf8>>) {
     True -> Ok(Nil)
     False -> Error("invalid HTTP header value")
@@ -275,7 +309,9 @@ pub fn decode_value(value: String) -> Result(String, String) {
 ///
 /// ## Examples
 ///
-/// `get([#("Mcp-Name", "echo")], "mcp-name")` returns `Ok("echo")`.
+/// ```gleam
+/// assert http_headers.get([#("Mcp-Name", "echo")], "mcp-name") == Ok("echo")
+/// ```
 pub fn get(
   headers: List(#(String, String)),
   name: String,
@@ -295,12 +331,18 @@ pub fn get(
 ///
 /// ## Examples
 ///
-/// `validate(plan, arguments, incoming)` returns an error for missing values.
+/// ```gleam
+/// let assert Ok(plan) = http_headers.compile(json.Object([]))
+/// assert http_headers.validate(plan, json.Object([]), []) == Ok(Nil)
+/// ```
 pub fn validate(
   plan: Plan,
   arguments: JsonValue,
   incoming: List(#(String, String)),
 ) -> Result(Nil, String) {
+  // Derive expected values from the JSON arguments, then require exact mirrors.
+  // The final pass also rejects headers for null or absent bound properties.
+
   use expected <- result.try(headers(plan, arguments))
   use Nil <- result.try(
     list.try_fold(expected, Nil, fn(_, header) {

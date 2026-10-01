@@ -4,6 +4,30 @@
 //// before stopping. Header and Origin refusals happen before worker admission.
 //// Request bodies use unambiguous Content-Length framing up to eight MiB.
 //// Transfer-Encoding is refused before Mist can buffer a declared HTTP chunk.
+////
+//// ## Flow
+////
+//// start_server -> start creates a loopback Mist listener. Each request follows
+//// handle -> admit before routing. post -> read_body -> body_framing bounds body
+//// collection, then validate_request -> http.validate -> route -> custom_headers
+//// checks body/header agreement before stream can admit application work.
+//// Refusals follow reject -> discard_body without JSON parsing or dispatch.
+////
+//// ## Stream transitions
+////
+//// | Phase | Event | Ownership change |
+//// | --- | --- | --- |
+//// | Parked | Start after socket transfer | Admit the weft scope, then Running. |
+//// | Running | Notify | Write one event; failed write cancels the scope. |
+//// | Running | Socket close or unexpected bytes | Cancel, then Draining. |
+//// | Running | Completed response | Write the final event, then Draining. |
+//// | Draining | AllDelivered | Close the socket and stop. |
+//// | Any | RunLost | Close and stop after scope loss; no normal drain proof. |
+////
+//// stream -> stream_loop separates the socket owner from dispatch_request's worker.
+//// A notification returned by the dispatcher starts a subscription; wait_for_close
+//// keeps its scope owned until cancellation. Draining proves local termination on
+//// the normal path. It doesn't prove a remote operation was rolled back.
 
 import gleam/bit_array
 import gleam/bytes_tree
@@ -46,11 +70,17 @@ pub type Admission {
 
 /// Validated listener settings; the default interface is always loopback.
 pub opaque type Config {
+  /// The settings admitted together before any transport effect.
   Config(
+    /// The admitted listener port; zero delegates selection to the OS.
     port: Int,
+    /// The POST endpoint path, without a query or fragment.
     path: String,
+    /// The exact allowlist for every present browser Origin.
     origins: List(String),
+    /// The operator's explicit credentials policy.
     admission: Admission,
+    /// The byte cap used before body collection and during refusal drains.
     limit: Int,
   )
 }
@@ -232,6 +262,8 @@ fn discard_chunk(state) {
   }
 }
 
+// Browser Origin and operator authentication answer separate admission
+// questions. Both finish before routing can read or dispatch a body.
 fn admit(config: Config, req: http_request.Request(mist.Connection)) {
   use Nil <- result.try(case http_headers.get(req.headers, "origin") {
     Error(_) ->
@@ -356,6 +388,8 @@ fn route(
   }
 }
 
+// Only a known tool input schema contributes custom mirrors. Unknown names
+// remain the dispatcher's protocol refusal rather than inventing a schema here.
 fn custom_headers(
   input_schema: fn(String) -> Option(schema.Schema),
   envelope,
@@ -384,6 +418,9 @@ fn read_body(req: http_request.Request(mist.Connection), limit: Int) {
   chunks(consume(65_536), <<>>, limit)
 }
 
+// The framing check already bounded the declared body. This second count
+// checks actual fragments before accumulation; it is a byte bound, not a total
+// wall-clock deadline for admitted body collection.
 fn chunks(chunk, bytes, limit) {
   use chunk <- result.try(
     chunk |> result.map_error(fn(_) { "malformed HTTP body" }),
@@ -401,6 +438,8 @@ fn chunks(chunk, bytes, limit) {
   }
 }
 
+// Stream messages belong to the socket owner below, after HTTP admission.
+// Handler values and scope retirement arrive separately on the same selector.
 type Message {
   Start
   Notify(JsonValue)
@@ -408,12 +447,16 @@ type Message {
   Socket(socket_native.Event)
 }
 
+// These are the socket actor's actual lifetime variants, not HTTP statuses.
+// Draining retains the actor after cancellation or final-response delivery.
 type Phase {
   Parked
   Running(cancel: weft.Cancel)
   Draining
 }
 
+// The inbox owns notifications; outcomes carry the weft scope's drain verdict.
+// Keeping both channels in the socket actor makes disconnect cleanup local.
 type State {
   State(
     inbox: Subject(Message),
@@ -452,6 +495,9 @@ fn stream(
   resp
 }
 
+// The socket actor keeps cancellation authority until a drained verdict.
+// A completed handler value can precede AllDelivered, so publishing that value
+// does not by itself authorize actor exit.
 fn stream_loop(
   _config: Config,
   dispatch: Dispatcher,

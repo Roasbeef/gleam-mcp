@@ -2,6 +2,18 @@
 //// Request state is an opaque server string. Input requests remain caller-owned
 //// work, and resumption requires responses with exactly the requested map keys.
 //// Optional sampling, roots and elicitation providers are not executed here.
+////
+//// ## Flow
+////
+//// input_request admits a supported provider method and object parameters;
+//// required checks presence and unique input keys. decode rebuilds those invariants
+//// from a peer result. responses checks exact keys and object values before resume
+//// can serialize responses_value. context decodes incoming server resume fields.
+////
+//// Required and Responses are opaque, so callers use checked constructors. A
+//// server Context remains untrusted input: checking its shape doesn't prove which
+//// suspension produced it. Provider execution and state integrity belong to the
+//// application, and a state-only suspension never triggers an automatic retry.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -10,6 +22,7 @@ import gleam_mcp/json.{type JsonValue}
 
 /// A server's input request, preserved for an explicit caller decision.
 pub opaque type InputRequest {
+  /// The admitted provider method and object parameters.
   InputRequest(
     /// The specification-defined input method.
     method: String,
@@ -20,19 +33,27 @@ pub opaque type InputRequest {
 
 /// A validated suspension with at least input requests or request state.
 pub opaque type Required {
+  /// The checked suspension returned to the explicit resumption path.
   Required(
+    /// Optional input requests with unique keys and at most 32 entries.
     requests: Option(List(#(String, InputRequest))),
+    /// Optional server-authored bytes, preserved without authentication.
     state: Option(String),
   )
 }
 
 /// Responses tied to the exact keys of a suspended request.
 pub opaque type Responses {
-  Responses(values: List(#(String, JsonValue)))
+  /// The checked response map tied to a suspension's exact keys.
+  Responses(
+    /// Exactly one object-valued response per requested key.
+    values: List(#(String, JsonValue)),
+  )
 }
 
 /// Input supplied on an explicitly resumed server request.
 pub type Context {
+  /// The admitted Context value.
   Context(
     /// Opaque state returned by the previous response, without interpretation.
     request_state: Option(String),
@@ -46,7 +67,8 @@ pub type Context {
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.input_request("elicitation/create", json.Object(fields))
+/// assert mrtr.input_request("roots/list", json.Object([])) |> result.is_ok
+/// assert mrtr.input_request("unknown/provider", json.Object([])) |> result.is_error
 /// ```
 pub fn input_request(
   method: String,
@@ -67,7 +89,8 @@ pub fn input_request(
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.required(None, Some("opaque-state")) requires no provider execution.
+/// assert mrtr.required(None, None) |> result.is_error
+/// assert mrtr.required(None, Some("opaque-state")) |> result.is_ok
 /// ```
 pub fn required(
   requests: Option(List(#(String, InputRequest))),
@@ -89,7 +112,7 @@ pub fn required(
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.load_shed("resume-token") never retries automatically.
+/// assert mrtr.request_state(mrtr.load_shed("token")) == Some("token")
 /// ```
 pub fn load_shed(state: String) -> Required {
   Required(None, Some(state))
@@ -100,7 +123,7 @@ pub fn load_shed(state: String) -> Required {
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.input_requests(required) is None for state-only suspension.
+/// assert mrtr.input_requests(mrtr.load_shed("token")) == None
 /// ```
 pub fn input_requests(
   required: Required,
@@ -130,6 +153,9 @@ pub fn responses(
   required: Required,
   values: List(#(String, JsonValue)),
 ) -> Result(Responses, String) {
+  // Exact key membership ties the provider results to this suspension. Matching
+  // count alone would let one requested input be replaced by an unrelated key.
+
   let expected = case required.requests {
     None -> []
     Some(requests) -> list.map(requests, fn(pair) { pair.0 })
@@ -162,7 +188,8 @@ pub fn responses(
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.responses_value(responses) preserves provider result payloads.
+/// let assert Ok(responses) = mrtr.responses(mrtr.load_shed("token"), [])
+/// assert mrtr.responses_value(responses) == json.Object([])
 /// ```
 pub fn responses_value(responses: Responses) -> JsonValue {
   json.Object(responses.values)
@@ -173,7 +200,10 @@ pub fn responses_value(responses: Responses) -> JsonValue {
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.value(mrtr.load_shed("token")) contains resultType input_required.
+/// assert mrtr.value(mrtr.load_shed("token")) == json.Object([
+///   #("resultType", json.String("input_required")),
+///   #("requestState", json.String("token")),
+/// ])
 /// ```
 pub fn value(required: Required) -> JsonValue {
   let fields = [#("resultType", json.String("input_required"))]
@@ -235,6 +265,9 @@ pub fn decode(value: JsonValue) -> Result(Required, String) {
 /// assert mrtr.context(json.Object([])) == Ok(mrtr.Context(None, None))
 /// ```
 pub fn context(params: JsonValue) -> Result(Context, String) {
+  // A resumed server request supplies untrusted bytes. Shape admission leaves
+  // state integrity, freshness and provider-result meaning with the handler.
+
   use fields <- result.try(object(params))
   use state <- result.try(optional_state(fields))
   use responses <- result.try(case list.key_find(fields, "inputResponses") {
@@ -306,7 +339,8 @@ fn validate_keys(keys: List(String)) -> Result(Nil, String) {
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.method(input) is elicitation/create for an admitted elicitation request.
+/// let assert Ok(input) = mrtr.input_request("roots/list", json.Object([]))
+/// assert mrtr.method(input) == "roots/list"
 /// ```
 pub fn method(input: InputRequest) -> String {
   input.method
@@ -317,7 +351,8 @@ pub fn method(input: InputRequest) -> String {
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.params(input) retains the server-authored provider payload.
+/// let assert Ok(input) = mrtr.input_request("roots/list", json.Object([]))
+/// assert mrtr.params(input) == json.Object([])
 /// ```
 pub fn params(input: InputRequest) -> JsonValue {
   input.params

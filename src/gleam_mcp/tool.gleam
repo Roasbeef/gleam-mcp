@@ -2,6 +2,18 @@
 //// Clients obtain result decoding from the same definition as argument
 //// encoding. A result decoder may additionally capture the original arguments,
 //// so request-specific invariants survive MRTR continuation unchanged.
+////
+//// ## Flow
+////
+//// new -> validate_name admits a wire name and an object argument schema, retaining
+//// both typed codecs together. encode_arguments and decode_arguments use the input
+//// codec; encode_output uses the output codec. result_codec binds decode_for to
+//// this call's original typed arguments before the client starts an exchange.
+////
+//// with_result_decoder installs domain checks that a static schema cannot express,
+//// such as an answer belonging to this request's allowed labels. It preserves the
+//// output schema and encoder. A Tool(args, output) cannot be paired with another
+//// argument type at a call site; opaque construction protects its name and codecs.
 
 import gleam/list as gleam_list
 import gleam/result
@@ -12,11 +24,17 @@ import gleam_mcp/schema.{type Schema}
 
 /// One wire method's argument and output types, tied to its schemas.
 pub opaque type Tool(args, output) {
+  /// The admitted tool definition and callbacks retained as one value.
   Tool(
+    /// The validated wire target, shared by client and server.
     name: String,
+    /// Caller-authored discovery text; it carries no execution authority.
     description: String,
+    /// The single schema-bound argument codec for args.
     arguments: Codec(args),
+    /// The single schema-bound output codec for output.
     output: Codec(output),
+    /// The domain decoder that receives this call's original typed arguments.
     decode_for: fn(args, JsonValue) -> Result(output, String),
   )
 }
@@ -35,7 +53,11 @@ pub type DefinitionError {
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.new("echo", "Echoes text.", arguments_codec, output_codec)
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.name(definition) == "echo"
+/// assert tool.new("bad name", "", codec.json(input), text) == Error(tool.InvalidName)
 /// ```
 pub fn new(
   name: String,
@@ -67,7 +89,17 @@ pub fn new(
 /// ## Examples
 ///
 /// ```gleam
-/// // definition |> tool.with_result_decoder(fn(args, result) { decode_choice(args.choices, result) })
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// let checked = tool.with_result_decoder(definition, fn(_, value) {
+///   case value {
+///     json.String("allowed") -> Ok("allowed")
+///     _ -> Error("answer is outside this request's domain")
+///   }
+/// })
+/// assert codec.decode(tool.result_codec(checked, json.Object([])), json.String("other"))
+///   == Error("answer is outside this request's domain")
 /// ```
 pub fn with_result_decoder(
   tool: Tool(args, output),
@@ -81,7 +113,10 @@ pub fn with_result_decoder(
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.name(definition) is used by both client and server.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.name(definition) == "echo"
 /// ```
 pub fn name(tool: Tool(args, output)) -> String {
   tool.name
@@ -92,7 +127,10 @@ pub fn name(tool: Tool(args, output)) -> String {
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.description(definition) is included in tools/list.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.description(definition) == "Echoes text."
 /// ```
 pub fn description(tool: Tool(args, output)) -> String {
   tool.description
@@ -103,7 +141,10 @@ pub fn description(tool: Tool(args, output)) -> String {
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.input_schema(definition) is passed to HTTP header admission.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert schema.value(tool.input_schema(definition)) == schema.value(input)
 /// ```
 pub fn input_schema(tool: Tool(args, output)) -> Schema {
   codec.schema(tool.arguments)
@@ -114,7 +155,10 @@ pub fn input_schema(tool: Tool(args, output)) -> Schema {
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.output_schema(definition) may describe any JSON type.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert schema.value(tool.output_schema(definition)) == schema.value(codec.schema(text))
 /// ```
 pub fn output_schema(tool: Tool(args, output)) -> Schema {
   codec.schema(tool.output)
@@ -125,7 +169,11 @@ pub fn output_schema(tool: Tool(args, output)) -> Schema {
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.encode_arguments(definition, args) runs before an HTTP request.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.encode_arguments(definition, json.Object([])) == Ok(json.Object([]))
+/// assert tool.encode_arguments(definition, json.Null) |> result.is_error
 /// ```
 pub fn encode_arguments(
   tool: Tool(args, output),
@@ -139,7 +187,10 @@ pub fn encode_arguments(
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.decode_arguments(definition, raw) cannot return another tool's args.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.decode_arguments(definition, json.Object([])) == Ok(json.Object([]))
 /// ```
 pub fn decode_arguments(
   tool: Tool(args, output),
@@ -153,7 +204,10 @@ pub fn decode_arguments(
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.encode_output(definition, output) refuses a lying custom encoder.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert tool.encode_output(definition, "hello") == Ok(json.String("hello"))
 /// ```
 pub fn encode_output(
   tool: Tool(args, output),
@@ -167,7 +221,10 @@ pub fn encode_output(
 /// ## Examples
 ///
 /// ```gleam
-/// // tool.result_codec(definition, args) is retained inside an opaque continuation.
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// assert codec.decode(tool.result_codec(definition, json.Object([])), json.String("hello")) == Ok("hello")
 /// ```
 pub fn result_codec(tool: Tool(args, output), args: args) -> Codec(output) {
   codec.with_decoder(tool.output, tool.decode_for(args, _))

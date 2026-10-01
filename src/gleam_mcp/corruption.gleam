@@ -10,8 +10,15 @@
 //// The context excerpt is bounded: reports are built from adversarial
 //// input, and an unbounded excerpt would let a hostile multi-megabyte
 //// payload bloat every log line or persisted report derived from its
-//// failure. `report` truncates `context` to `max_context_length`
-//// graphemes, so a report's size is bounded regardless of its input.
+//// failure. `report` truncates `context` to `max_context_length` graphemes.
+//// The other descriptive fields remain decoder-supplied strings.
+////
+//// ## Flow
+////
+//// report -> bound truncates the raw context before storing it. describe formats
+//// that stored record for diagnostics. Only context has the grapheme cap; boundary,
+//// subject and expected are supplied by the decoder and are not capped here.
+//// A grapheme cap is a text-length policy, not an aggregate byte budget.
 
 import gleam/string
 
@@ -33,10 +40,15 @@ pub const max_context_length = 256
 /// `max_context_length` graphemes; direct construction bypasses that bound
 /// and should not be used with untrusted input.
 pub type CorruptionReport {
+  /// The structured diagnostic; prefer report when input is untrusted.
   CorruptionReport(
+    /// The decoder or wire boundary where the refusal arose.
     boundary: String,
+    /// The field, id, pointer or offset implicated by the refusal.
     subject: String,
+    /// The required shape or value, expressed without rejected payload data.
     expected: String,
+    /// The diagnostic excerpt; report bounds it before construction.
     context: String,
   )
 }

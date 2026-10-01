@@ -7,6 +7,17 @@
 //// their shared syntax. ASCII digit/word shorthands, Unicode whitespace, dot,
 //// and end-of-input assertions receive explicit equivalents. Unicode escapes
 //// become literal codepoints, and general-category properties use shared aliases.
+////
+//// ## Flow
+////
+//// compile -> translate scans the source with explicit character-class position.
+//// escaped and group admit shared syntax; property, unicode_escape and fixed_escape
+//// translate supported forms. unsupported returns a CompileError before the schema
+//// can be registered; regexp.from_string owns native compilation after translation.
+////
+//// The translation is a supported subset, not arbitrary ECMAScript equivalence.
+//// Native matching still uses OTP's regexp backend. The evaluator's logical work
+//// allowance does not impose a wall-clock limit on one native regex match.
 
 import gleam/int
 import gleam/list
@@ -37,6 +48,9 @@ pub fn compile(source: String) -> Result(Regexp, CompileError) {
   regexp.from_string(translated)
 }
 
+// Position changes the meaning of escapes and delimiters. Keep it explicit
+// while scanning so a shorthand translated outside a class cannot silently
+// change meaning inside one.
 fn translate(
   chars: List(String),
   position: Position,
@@ -85,6 +99,8 @@ fn group(
   }
 }
 
+// Translate only escapes whose meaning is preserved by the supported subset.
+// Backend-specific syntax is a construction refusal, not a permissive fallback.
 fn escaped(
   escape: String,
   rest: List(String),

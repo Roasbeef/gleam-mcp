@@ -29,6 +29,13 @@
 //// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 //// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 //// POSSIBILITY OF SUCH DAMAGE.
+////
+//// ## Flow
+////
+//// resources returns the embedded official URI/document pairs. document's compiler
+//// adds these pairs to the available offline registry and loads only referenced
+//// resources. The literals below are data tables; their declaration order has no
+//// runtime effect and their provenance and license remain attached here.
 
 import gleam_mcp/json.{type JsonValue}
 

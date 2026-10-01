@@ -3,9 +3,38 @@
 //// Legacy lifecycle transitions run in order beside one bounded lookahead.
 //// Modern requests use a retained coordinator, one reader, one writer and at
 //// most eight witnessed handler scopes, so control traffic remains live while
-//// callbacks block. Writer backpressure bounds admission to 128 queued frames.
+//// callbacks block. Writer backpressure parks lookahead at 128 queued frames.
 //// EOF stops admission and drains each admitted callback under its existing
 //// deadline; read or write failure cancels and joins all owned scopes.
+////
+//// ## Flow
+////
+//// run -> run_with_options -> run_with_io reads the first bounded line and selects
+//// the profile. Legacy serve_line -> bounded_dispatch -> collect overlaps one
+//// lookahead read with ordered dispatch. The inner callback parks until its scope
+//// is adopted by the managed outer task; wrapper exit alone isn't cleanup proof.
+////
+//// Modern modern_run -> modern_owner starts a parked coordinator. After adoption,
+//// Begin starts the writer, admits the first line and starts read_lines. Each tool
+//// call follows admit_line -> admit_handler; controls stay in the coordinator.
+//// HandlerReady permits execution only after the scope is retained, and Answer
+//// retains the response until owner_down observes the scope's exit.
+////
+//// ## Modern coordinator transitions
+////
+//// | Phase | Event | Work still owned |
+//// | --- | --- | --- |
+//// | Parked | Begin | Admit writer, first handler if needed, and reader. |
+//// | Accepting | Input line | Admit bounded work; park reader under backpressure. |
+//// | Accepting | EOF | Enter Ending; existing handler deadlines stay in force. |
+//// | Accepting or Ending | I/O failure or Stop | Cancel all witnessed scopes. |
+//// | Ending | ScopeDown or Written | Remove custody and queued frames as each settles. |
+//// | Ending | No reader, handlers, queued frames or writer | Publish outcome and stop. |
+////
+//// resume_reader gates lookahead at the queued-write threshold; it doesn't change
+//// the eight-handler limit. Already admitted work can still enqueue its answers.
+//// settle_modern and abort_owner retain scope handles until DOWN events retire them.
+//// EOF drains admitted callbacks; cancellation proves worker exit, not rollback.
 
 import gleam/erlang/process
 import gleam/int
@@ -45,6 +74,7 @@ pub type StdioError {
 
 /// The positive per-request deadline used by the foreground server.
 pub opaque type Options {
+  /// The request or startup settings used by this module.
   Options(
     /// The positive callback budget; it also bounds drain after EOF.
     request_timeout_ms: Int,
@@ -56,7 +86,9 @@ pub opaque type Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // server_stdio.options()
+/// assert server_stdio.options() == server_stdio.with_request_timeout(
+///   server_stdio.options(), server_stdio.default_request_timeout_ms,
+/// )
 /// ```
 pub fn options() -> Options {
   Options(default_request_timeout_ms)
@@ -69,7 +101,8 @@ pub fn options() -> Options {
 /// ## Examples
 ///
 /// ```gleam
-/// // server_stdio.options() |> server_stdio.with_request_timeout(5000)
+/// assert server_stdio.with_request_timeout(server_stdio.options(), 0)
+///   == server_stdio.with_request_timeout(server_stdio.options(), 1)
 /// ```
 pub fn with_request_timeout(_options: Options, ms: Int) -> Options {
   Options(request_timeout_ms: int.clamp(ms, 1, 4_294_966_295))
@@ -132,6 +165,8 @@ pub fn run_with_io(
   }
 }
 
+// Legacy dispatch and lookahead can finish in either order. The collector
+// retains both results before advancing the registry to another line.
 type Event {
   Handled(server: Server, response: Option(JsonValue))
   Read(line: Option(String))
@@ -327,6 +362,8 @@ type ModernEvent {
   Stop
 }
 
+// None means no Answer has arrived. Some(None) is a completed dispatch with
+// no response, kept distinct until the scope's normal exit authorizes removal.
 type Handler {
   Handler(
     id: jsonrpc.Id,
@@ -335,6 +372,8 @@ type Handler {
   )
 }
 
+// This is the coordinator's custody ledger and backpressure state. A retained
+// reader, writer or handler disappears only when its scope exit is observed.
 type ModernState {
   ModernState(
     registry: Server,
@@ -472,6 +511,9 @@ fn modern_owner(
   |> sm.start
 }
 
+// Begin is the custody permit; input and handler gates regulate admission
+// after it. Ending still consumes completion events so every retained scope
+// can be removed by its actual exit witness.
 fn modern_event(
   phase: ModernPhase,
   state: ModernState,
@@ -563,6 +605,8 @@ fn begin_writer(state: ModernState) -> ModernState {
   ModernState(..state, writer: Some(writer), writer_inbox: Some(inbox))
 }
 
+// The reader hands off one complete line and parks. Only the coordinator
+// releases that gate, keeping lookahead and writer backlog bounded.
 fn read_lines(
   read: fn() -> Result(Option(String), StdioError),
   events: process.Subject(ModernEvent),
@@ -694,6 +738,9 @@ fn close_subscriptions(state: ModernState) -> ModernState {
   })
 }
 
+// An answer was retained before the worker was released. Its normal scope
+// exit authorizes delivery; abnormal exit substitutes a failure and still
+// removes exactly that scope's custody.
 fn owner_down(
   phase: ModernPhase,
   state: ModernState,
@@ -748,6 +795,8 @@ fn owner_down(
   }
 }
 
+// End admission first, then empty handlers, reader and queued writes. The
+// writer is canceled last so admitted responses have a chance to be delivered.
 fn settle_modern(
   phase: ModernPhase,
   state: ModernState,
@@ -770,6 +819,8 @@ fn settle_modern(
   }
 }
 
+// Failure requests cancellation without discarding the witnessed handles.
+// Ending retains those handles until their DOWN events complete retirement.
 fn abort_owner(
   state: ModernState,
   error: StdioError,

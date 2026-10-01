@@ -1,6 +1,14 @@
 //// Decimal arithmetic preserves JSON Schema's mathematical number semantics.
 //// Floats are interpreted through their shortest decimal rendering, so a
 //// decimal multiple such as 0.0075 / 0.0001 does not acquire a binary remainder.
+////
+//// ## Flow
+////
+//// from_json -> from_text turns an integer or the shortest float rendering into
+//// a numerator and denominator. compare cross-multiplies those ratios;
+//// is_integer checks the denominator's remainder and multiple checks divisibility.
+//// The representation preserves decimal assertions after parsing. It doesn't
+//// recover precision already lost when a source literal became a Float.
 
 import gleam/float
 import gleam/int
@@ -35,6 +43,8 @@ pub fn from_json(value: JsonValue) -> Result(Decimal, Nil) {
   }
 }
 
+// Rendering supplies a decimal mantissa and exponent. Moving the decimal
+// point uses integer arithmetic, so later comparisons need no binary division.
 fn from_text(text: String) -> Result(Decimal, Nil) {
   let parts = string.split(string.lowercase(text), "e")
   let mantissa = list.first(parts) |> result.unwrap("0")
@@ -102,6 +112,9 @@ pub fn is_integer(value: JsonValue) -> Bool {
 /// assert number.multiple(json.Float(0.0075), json.Float(0.0001))
 /// ```
 pub fn multiple(value: JsonValue, divisor: JsonValue) -> Bool {
+  // Cross-multiplication compares decimal ratios exactly. Binary floating-point
+  // modulo would reject some decimal multiples even after schema admission.
+
   case from_json(value), from_json(divisor) {
     Ok(Decimal(n, d)), Ok(Decimal(m, e)) if m > 0 -> n * e % { d * m } == 0
     _, _ -> False

@@ -1,55 +1,45 @@
-//// The MCP client actor: one explicitly owned long-lived process owning one
-//// MCP server peer over the stdio transport, driving the initialize
-//// lifecycle and serving typed calls — list every tool, call a tool.
+//// A native client owns one stdio peer; typed calls can also use any caller-owned
+//// request.Endpoint. The native actor has separate legacy initialization and modern
+//// request paths. Neither path reconnects or retries after a transport failure.
 ////
-//// The actor is written against `gleam_mcp/transport.Transport`, so whether
-//// the server process is a real child on an Erlang port or an
-//// in-process test peer is the injector's decision; see that module for
-//// why the seam exists and for the security posture of spawning.
+//// ## Flow
 ////
-//// ## The v1 posture (issue #106)
+//// Legacy startup follows start -> prepare_owned -> start_actor -> connect ->
+//// open_transport -> handshake -> accept_initialize. Modern startup follows
+//// start_modern -> prepare -> connect_modern and opens without an initialize call.
+//// The owner is parked before opening so a custodian can retain cleanup authority.
 ////
-//// **No restart, no reconnect.** A dead peer — the process exited, the
-//// transport closed, a framing fault poisoned the line stream — settles
-//// every in-flight call as `Unavailable` and latches the client dead
-//// for the session; later calls answer `Unavailable` in-band without
-//// crashing anything. The supervised substrate grows reconnection teeth
-//// in phase 5 (the LSP client, issue #25), not here.
+//// Typed calls follow call -> perform_call -> send_request -> request.exchange.
+//// An input_required result returns Continuation; resume reuses its endpoint,
+//// encoded arguments, schema, decoder and revision in a new explicit attempt.
+//// On native stdio, endpoint -> raw_exchange -> handle_raw_request assigns a wire
+//// id. feed_chunk -> feed_lines -> handle_line routes the peer's response back to
+//// the original caller id. Subscription notifications pass through route_stream
+//// before invoking the caller's observer.
 ////
-//// **No server-initiated anything.** This client declares an empty
-//// capabilities object (see `gleam_mcp/protocol.initialize_request` for why
-//// that is a security decision), so a server-initiated *request* —
-//// sampling, roots, elicitation, whatever else — is answered in-band
-//// with JSON-RPC method-not-found (-32601), and a server *notification*
-//// is decoded and dropped.
+//// ## Native owner transitions
 ////
-//// ## Faults are values, and the envelope decides which are fatal
+//// | Phase | Event | Result and ownership |
+//// | --- | --- | --- |
+//// | Prepared | Open | Open once, then Serving; opening refusal retains an empty proof. |
+//// | Prepared | Retire | Return NoNativeResource, then stop. |
+//// | Serving | Shutdown or Retire | Settle calls, request termination, then Closing. |
+//// | Closing | TransportClosed | Retain NativeExited in Retired while custody is held. |
+//// | Retired | Retire | Transfer the proof, then stop normally. |
 ////
-//// The posture mirrors the cap channel's: a line that is not a
-//// well-formed JSON-RPC message, a byte stream that is not UTF-8, and a
-//// line past `gleam_mcp/stdio.max_line_bytes` are channel-fatal — every
-//// in-flight call settles at once and the client latches dead — while
-//// well-formed messages this client merely does not act on (an unknown
-//// or forgotten response id, a notification) are dropped and the
-//// channel stays open. Nothing here panics; every fault is a value.
+//// shutdown requires both explicit resource evidence and the original owner's
+//// normal DOWN event. A timeout or abnormal death reports uncertain retirement.
+//// TransportClosed proves the selected child exited; it doesn't join descendants
+//// or reverse effects already performed by that child.
 ////
-//// ## Callers are never killed by a slow or dead actor
+//// Malformed JSON-RPC, invalid UTF-8 and oversized lines close the native channel.
+//// Unknown response ids are dropped. A call deadline forgets the id so late replies
+//// cannot settle a later call. Modern subscriptions additionally validate their
+//// acknowledgement, accepted sources and id before delivering notifications.
 ////
-//// Every public call is a monitored send-and-select (the
-//// `broker/internal/call.try_call` shape), never `process.call`, which
-//// panics on a timeout and on a dead callee. A dead client answers
-//// `Unavailable`; a wedged one answers `Unavailable` after the call's
-//// own deadline plus a small margin. Each in-flight call carries its
-//// own deadline inside the actor too: at expiry the caller gets a typed
-//// `CallTimedOut` and the actor forgets the id, so a late response to a
-//// forgotten id is dropped silently.
-////
-//// `prepare` parks the owner before transport opening. After external custody
-//// is published, `connect` opens the transport in that same owner. Stopping
-//// settles calls immediately but retains the exact port until native exit.
-//// Typed `shutdown` then consumes explicit retirement proof and observes the
-//// original normal actor DOWN. A deadline or unexpected owner death cannot
-//// substitute for either proof.
+//// Gleam's opaque types hide constructors from consumers. That keeps a continuation
+//// from being rebuilt with another endpoint or decoder; it doesn't authenticate the
+//// server's requestState bytes. Applications own that integrity check.
 
 import gleam/bit_array
 import gleam/bool
@@ -106,10 +96,16 @@ pub const max_tool_pages = 64
 /// server-initiated request.
 pub const method_not_found_code = -32_601
 
-/// An opaque handle to a started client actor. Sendable across
-/// processes; every public function takes one.
+/// An opaque handle to the native stdio owner, sendable across processes.
+/// Typed endpoint calls can also use transports that have no client actor.
 pub opaque type Client {
-  Client(subject: Subject(Msg), owner: process.Pid)
+  /// The actor identity and command channel retained together.
+  Client(
+    /// The private command channel whose constructors stay inside this module.
+    subject: Subject(Msg),
+    /// The original actor pid whose normal exit completes retirement.
+    owner: process.Pid,
+  )
 }
 
 /// Why a shutdown could not establish both transport retirement and actor exit.
@@ -121,18 +117,34 @@ pub type RetirementError {
   RetirementUnconfirmed
 }
 
+// Evidence belongs to the owner that performed the open, not to its observer.
+// An empty preparation and an observed native exit prove different lifetimes.
 type RetirementProof {
+  // Opening never admitted a native resource.
   NoNativeResource
+
+  // The selected transport reported its direct peer's exit.
   NativeExited(reason: String)
 }
 
+// Native lifetime phases are separate from an initialized MCP session.
+// Modern and legacy profiles share this same ownership state machine.
 type Phase {
+  // The actor can be published, but the transport is still unopened.
   Prepared
+
+  // The opened transport can admit protocol work.
   Serving
+
+  // Calls are settled; native retirement evidence is still outstanding.
   Closing
+
+  // Resource evidence is retained until custody transfers or is lost.
   Retired(proof: RetirementProof)
 }
 
+// A native exit can stop immediately only after the custodian has gone.
+// While held, the proof remains available for an explicit retirement request.
 type Custody {
   Held
   Lost
@@ -140,11 +152,12 @@ type Custody {
 
 /// Options for `start`.
 ///
-/// Constructor invariants: `handshake_timeout_ms` is a positive
-/// millisecond budget for the whole `initialize` round trip;
-/// `client_version` is the caller's version, carried verbatim in
-/// `clientInfo`.
+/// The option helpers clamp `handshake_timeout_ms` to a positive budget for
+/// the whole `initialize` round trip. Callers constructing this public record
+/// directly must preserve that budget. The caller's identity and version are
+/// carried verbatim in `clientInfo`.
 pub type Options {
+  /// The request or startup settings used by this module.
   Options(
     /// The caller-owned name advertised in clientInfo.
     client_name: String,
@@ -154,6 +167,211 @@ pub type Options {
     handshake_timeout_ms: Int,
   )
 }
+
+/// Why a call produced no usable result. Plain data, always in-band:
+/// no variant here is ever a caller's crash.
+pub type ClientError {
+  /// The client (or the server it owned) is not available: the peer
+  /// died, the transport closed, a framing fault latched the client
+  /// dead, or the actor itself is gone. `reason` names which.
+  Unavailable(
+    /// The diagnostic cause, without implying remote effects were rolled back.
+    reason: String,
+  )
+
+  /// The call did not complete within its own deadline. The id is
+  /// forgotten; a response arriving later is dropped silently.
+  CallTimedOut(
+    /// The request budget that expired, in milliseconds.
+    after_ms: Int,
+  )
+
+  /// The server answered the call with a JSON-RPC error.
+  ServerError(
+    /// The peer's JSON-RPC error code.
+    code: Int,
+    /// The peer-authored diagnostic, retained as untrusted text.
+    message: String,
+  )
+
+  /// The server's result was well-formed JSON-RPC but not the shape the
+  /// method promises; `reason` names the field that broke it.
+  ResultMalformed(
+    /// The diagnostic cause, without implying remote effects were rolled back.
+    reason: String,
+  )
+
+  /// `tools/list` pagination did not exhaust within `max_tool_pages`
+  /// pages; `cap` restates the ceiling that was hit.
+  TooManyPages(
+    /// The maximum page count admitted by this traversal.
+    cap: Int,
+  )
+}
+
+/// Why startup produced no serving client. Staged startup retains the owner
+/// after a refusal so its published custodian can verify native retirement.
+pub type StartError {
+  /// The transport could not open — the server executable did not
+  /// spawn, or the actor could not start.
+  TransportFailed(
+    /// The diagnostic cause, without implying remote effects were rolled back.
+    reason: String,
+  )
+
+  /// The `initialize` exchange itself failed: a server error, a
+  /// malformed result, a closed transport, or the handshake deadline.
+  HandshakeFailed(
+    /// The failed stage's typed verdict.
+    error: ClientError,
+  )
+
+  /// The server negotiated a protocol revision this client cannot
+  /// speak. Carries both sides so the refusal can be worded without
+  /// re-asking.
+  VersionUnsupported(
+    /// The protocol revision returned by the peer.
+    server: String,
+    /// The legacy contracts available to this client.
+    supported: List(String),
+  )
+
+  /// The server did not declare the tools capability, and tools are the
+  /// only thing this client exists to reach.
+  ToolsNotDeclared
+
+  /// Startup failed and retirement is uncertain; retain this client's custody.
+  CleanupUnconfirmed(
+    /// The still-owned client handle whose retirement remains uncertain.
+    client: Client,
+  )
+}
+
+/// The client actor's message set. Opaque: only this module constructs
+/// these, so nothing can inject a forged response or expiry.
+pub opaque type Msg {
+  /// Opens the already-published client transport, exactly once.
+  Open(
+    /// The caller's channel for the correlated verdict or resource proof.
+    reply: Subject(Result(Nil, StartError)),
+  )
+
+  /// The preparer disappeared before admitting native work.
+  PreparerGone
+
+  /// The published cleanup owner can no longer claim retirement evidence.
+  CustodianGone
+
+  /// Requests retirement proof before the owning actor may stop normally.
+  Retire(
+    /// The caller's channel for the correlated verdict or resource proof.
+    reply: Subject(RetirementProof),
+  )
+
+  /// One outbound request: `build` receives the actor-minted id and
+  /// returns the full JSON-RPC message; the correlated result (or the
+  /// typed error) is sent to `reply`.
+  Request(
+    /// Builds an envelope with the actor's allocated wire id.
+    build: fn(Id) -> JsonValue,
+    /// The positive budget enforced by the actor, in milliseconds.
+    deadline_ms: Int,
+    /// The caller's channel for the correlated verdict or resource proof.
+    reply: Subject(Result(JsonValue, ClientError)),
+  )
+
+  /// A modern request retains its exact envelope correlation and observer.
+  RawRequest(
+    /// The original envelope, timer and observer retained for this request.
+    outbound: requests.Outbound,
+    /// The caller's channel for the correlated verdict or resource proof.
+    reply: Subject(RawEvent),
+  )
+
+  /// The owner of a modern request disappeared before its response settled.
+  RawCallerGone(
+    /// The request owner monitor that identifies abandoned work.
+    monitor: process.Monitor,
+  )
+
+  /// Explicit cancellation identifies the caller's original request id.
+  CancelRaw(
+    /// The request identity used for correlation or cancellation.
+    id: Id,
+  )
+
+  /// One outbound notification, fire-and-forget.
+  Notify(
+    /// A complete outbound notification; it expects no response.
+    message: JsonValue,
+  )
+
+  /// Inbound bytes or the close, from the port selector or a test peer.
+  FromTransport(
+    /// Native bytes or direct-peer retirement evidence.
+    event: transport.TransportEvent,
+  )
+
+  /// A call's deadline lapsed; if the id is still in flight the caller
+  /// is answered `CallTimedOut` and the id is forgotten.
+  Expire(
+    /// The request identity used for correlation or cancellation.
+    id: Int,
+  )
+
+  /// Requests termination and settles calls, retaining the native-exit proof
+  /// until `Retire` transfers it to the custodian.
+  Shutdown
+}
+
+// Each admitted request retains its reply ownership until settlement or expiry.
+// Deadlines remove entries without recycling their allocated integer ids.
+type InFlight {
+  InFlight(reply: Reply, deadline_ms: Int)
+}
+
+// The modern reply retains both identities: the caller's envelope id and the
+// actor's allocated peer id, which is the enclosing inflight dictionary key.
+type Reply {
+  LegacyReply(Subject(Result(JsonValue, ClientError)))
+  ModernReply(
+    original_id: Id,
+    reply: Subject(RawEvent),
+    monitor: process.Monitor,
+    stream: Option(subscription.Stream),
+  )
+}
+
+// Observers and final answers use one reply channel so their arrival ordering
+// remains visible to the caller without invoking application code in the actor.
+type RawEvent {
+  RawNotification(JsonValue)
+  RawResult(Result(JsonValue, requests.Error))
+}
+
+// The actor retains transport custody and pending protocol work in one value.
+// Resource identity stays here through Closing even after calls are settled.
+type State {
+  State(
+    transport_spec: Option(Transport),
+    inbound: Subject(transport.TransportEvent),
+    selector: process.Selector(Msg),
+    connection: transport.Connection,
+    buffer: stdio.Buffer,
+    // The held tail of an incomplete UTF-8 sequence between chunks; at
+    // most `transport.max_held_tail_bytes` bytes.
+    tail: BitArray,
+    next_id: Int,
+    inflight: Dict(Int, InFlight),
+    // `Some(reason)` once the peer is gone: no response can arrive, so
+    // new calls are refused in-band rather than waiting out deadlines.
+    dead: Option(String),
+    commands: Subject(Msg),
+    custody: Custody,
+  )
+}
+
+// Native client settings and lifecycle entry points.
 
 /// Options with the default handshake budget.
 ///
@@ -191,7 +409,7 @@ pub fn with_client_name(options: Options, name: String) -> Options {
 /// ```gleam
 /// assert client.options("0.1.0")
 ///   |> client.with_handshake_timeout(500)
-///   == client.Options(client_version: "0.1.0", handshake_timeout_ms: 500)
+///   == client.Options(client_name: "gleam-mcp", client_version: "0.1.0", handshake_timeout_ms: 500)
 /// ```
 ///
 pub fn with_handshake_timeout(options: Options, ms: Int) -> Options {
@@ -199,143 +417,6 @@ pub fn with_handshake_timeout(options: Options, ms: Int) -> Options {
   // reach process.send_after, which raises on negatives.
   Options(..options, handshake_timeout_ms: int.max(ms, 1))
 }
-
-/// Why a call produced no usable result. Plain data, always in-band:
-/// no variant here is ever a caller's crash.
-pub type ClientError {
-  /// The client (or the server it owned) is not available: the peer
-  /// died, the transport closed, a framing fault latched the client
-  /// dead, or the actor itself is gone. `reason` names which.
-  Unavailable(reason: String)
-
-  /// The call did not complete within its own deadline. The id is
-  /// forgotten; a response arriving later is dropped silently.
-  CallTimedOut(after_ms: Int)
-
-  /// The server answered the call with a JSON-RPC error.
-  ServerError(code: Int, message: String)
-
-  /// The server's result was well-formed JSON-RPC but not the shape the
-  /// method promises; `reason` names the field that broke it.
-  ResultMalformed(reason: String)
-
-  /// `tools/list` pagination did not exhaust within `max_tool_pages`
-  /// pages; `cap` restates the ceiling that was hit.
-  TooManyPages(cap: Int)
-}
-
-/// Why startup produced no serving client. Staged startup retains the owner
-/// after a refusal so its published custodian can verify native retirement.
-pub type StartError {
-  /// The transport could not open — the server executable did not
-  /// spawn, or the actor could not start.
-  TransportFailed(reason: String)
-
-  /// The `initialize` exchange itself failed: a server error, a
-  /// malformed result, a closed transport, or the handshake deadline.
-  HandshakeFailed(error: ClientError)
-
-  /// The server negotiated a protocol revision this client cannot
-  /// speak. Carries both sides so the refusal can be worded without
-  /// re-asking.
-  VersionUnsupported(server: String, supported: List(String))
-
-  /// The server did not declare the tools capability, and tools are the
-  /// only thing this client exists to reach.
-  ToolsNotDeclared
-
-  /// Startup failed and retirement is uncertain; retain this client's custody.
-  CleanupUnconfirmed(client: Client)
-}
-
-/// The client actor's message set. Opaque: only this module constructs
-/// these, so nothing can inject a forged response or expiry.
-pub opaque type Msg {
-  /// Opens the already-published client transport, exactly once.
-  Open(reply: Subject(Result(Nil, StartError)))
-
-  /// The preparer disappeared before admitting native work.
-  PreparerGone
-
-  /// The published cleanup owner can no longer claim retirement evidence.
-  CustodianGone
-
-  /// Requests retirement proof before the owning actor may stop normally.
-  Retire(reply: Subject(RetirementProof))
-
-  /// One outbound request: `build` receives the actor-minted id and
-  /// returns the full JSON-RPC message; the correlated result (or the
-  /// typed error) is sent to `reply`.
-  Request(
-    build: fn(Id) -> JsonValue,
-    deadline_ms: Int,
-    reply: Subject(Result(JsonValue, ClientError)),
-  )
-
-  /// A modern request retains its exact envelope correlation and observer.
-  RawRequest(outbound: requests.Outbound, reply: Subject(RawEvent))
-
-  /// The owner of a modern request disappeared before its response settled.
-  RawCallerGone(monitor: process.Monitor)
-
-  /// Explicit cancellation identifies the caller's original request id.
-  CancelRaw(id: Id)
-
-  /// One outbound notification, fire-and-forget.
-  Notify(message: JsonValue)
-
-  /// Inbound bytes or the close, from the port selector or a test peer.
-  FromTransport(event: transport.TransportEvent)
-
-  /// A call's deadline lapsed; if the id is still in flight the caller
-  /// is answered `CallTimedOut` and the id is forgotten.
-  Expire(id: Int)
-
-  /// Requests termination and settles calls, retaining the native-exit proof
-  /// until `Retire` transfers it to the custodian.
-  Shutdown
-}
-
-type InFlight {
-  InFlight(reply: Reply, deadline_ms: Int)
-}
-
-type Reply {
-  LegacyReply(Subject(Result(JsonValue, ClientError)))
-  ModernReply(
-    original_id: Id,
-    reply: Subject(RawEvent),
-    monitor: process.Monitor,
-    stream: Option(subscription.Stream),
-  )
-}
-
-type RawEvent {
-  RawNotification(JsonValue)
-  RawResult(Result(JsonValue, requests.Error))
-}
-
-type State {
-  State(
-    transport_spec: Option(Transport),
-    inbound: Subject(transport.TransportEvent),
-    selector: process.Selector(Msg),
-    connection: transport.Connection,
-    buffer: stdio.Buffer,
-    // The held tail of an incomplete UTF-8 sequence between chunks; at
-    // most `transport.max_held_tail_bytes` bytes.
-    tail: BitArray,
-    next_id: Int,
-    inflight: Dict(Int, InFlight),
-    // `Some(reason)` once the peer is gone: no response can arrive, so
-    // new calls are refused in-band rather than waiting out deadlines.
-    dead: Option(String),
-    commands: Subject(Msg),
-    custody: Custody,
-  )
-}
-
-// --- public API -------------------------------------------------------------
 
 /// Starts the client: opens the transport (spawning the server, for a
 /// port transport), performs `initialize` → `notifications/initialized`
@@ -693,6 +774,8 @@ fn describe_start_error(error: actor.StartError) -> String {
 
 // --- the actor --------------------------------------------------------------
 
+// The constructor returns a parked owner. Its selector already observes both
+// the preparer and custodian, so opening cannot precede cleanup publication.
 fn start_actor(
   transport_spec: Transport,
   custodian: process.Pid,
@@ -743,6 +826,8 @@ fn start_actor(
   })
 }
 
+// Phase and message are matched together because the same retirement request
+// has different custody meaning before open, during close and after native exit.
 fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
   case phase, msg {
     Prepared, Open(reply) -> open_transport(state, reply)
@@ -943,6 +1028,8 @@ fn feed_chunk(state: State, bytes: BitArray) -> sm.Next(Phase, State, Msg) {
   }
 }
 
+// This is the direct peer's retirement event. Keep its proof until the held
+// custodian asks for it; a lost custodian no longer needs an actor retaining it.
 fn handle_closed(state: State, reason: String) -> sm.Next(Phase, State, Msg) {
   // The peer is already gone: replace the connection with an inert one
   // before `die` closes it, so a port close never chases the exited
@@ -962,6 +1049,8 @@ fn begin_close(state: State, reason: String) -> sm.Next(Phase, State, Msg) {
   sm.transition(Closing, die(state, reason))
 }
 
+// Expiry removes only the still-outstanding id. A timer already queued for a
+// settled id is harmless, and a late response cannot be assigned to a new caller.
 fn handle_expire(state: State, id: Int) -> sm.Next(Phase, State, Msg) {
   case dict.get(state.inflight, id) {
     // Already answered (or already settled by a death) — the timer is
@@ -1000,8 +1089,8 @@ fn handle_line(state: State, line: String) -> Result(State, String) {
       refuse_server_request(state, id)
     Ok(jsonrpc.UncorrelatedError(_)) -> Ok(state)
 
-    // v1 subscribes to nothing, so every notification is decoded (so
-    // nothing hostile hides in one) and dropped.
+    // Modern subscription events must pass their pending stream contract before
+    // delivery. Legacy notifications and unrelated modern events are ignored.
     Ok(jsonrpc.Correlated(jsonrpc.Notification(method, params))) -> {
       route_notification(state, method, params)
     }
@@ -1095,24 +1184,41 @@ fn die(state: State, reason: String) -> State {
 /// The typed outcome of one explicit tools/call exchange.
 pub type CallOutcome(output) {
   /// The original definition decoded successful structured output.
-  Complete(output: output)
+  Complete(
+    /// The value decoded by the original tool's request-bound codec.
+    output: output,
+  )
 
   /// The tool returned a visible failure without satisfying its output schema.
-  ToolFailed(result: protocol.CallToolResult)
+  ToolFailed(
+    /// The tool-level failure payload, outside the successful output contract.
+    result: protocol.CallToolResult,
+  )
 
   /// The request paused; only this continuation can resume its original call.
-  InputRequired(continuation: Continuation(output))
+  InputRequired(
+    /// The original call contract retained for an explicit next attempt.
+    continuation: Continuation(output),
+  )
 }
 
 /// An endpoint, arguments, decoder and opaque state retained as one value.
 pub opaque type Continuation(output) {
+  /// The original call contract and latest suspension, constructed only here.
   Continuation(
+    /// The original exchange callback and admission policy.
     endpoint: requests.Endpoint,
+    /// The original tool's validated wire name.
     name: String,
+    /// The original arguments after checked encoding, reused on resume.
     arguments: JsonValue,
+    /// The compiled input schema retained for transport mirrors.
     input_schema: schema.Schema,
+    /// The output codec with domain checks closed over the original typed arguments.
     decoder: codec.Codec(output),
+    /// The original wire contract, which resume options must preserve.
     revision: version.Version,
+    /// The latest suspension, including exact input keys and optional opaque state.
     required: mrtr.Required,
   )
 }
@@ -1122,7 +1228,20 @@ pub opaque type Continuation(output) {
 /// ## Examples
 ///
 /// ```gleam
-/// // client.call(endpoint, definition, typed_args, request.options("agent", "1"))
+/// let assert Ok(input) = schema.new(json.Object([#("type", json.String("object"))]))
+/// let assert Ok(text) = codec.string()
+/// let assert Ok(definition) = tool.new("echo", "Echoes text.", codec.json(input), text)
+/// let endpoint = request.endpoint("local", fn(outbound) {
+///   let assert Ok(jsonrpc.Correlated(jsonrpc.ServerRequest(id, ..))) =
+///     jsonrpc.decode_value(outbound.envelope)
+///   Ok(jsonrpc.response(id, json.Object([
+///     #("resultType", json.String("complete")),
+///     #("content", json.Array([])),
+///     #("structuredContent", json.String("hello")),
+///   ])))
+/// })
+/// assert client.call(endpoint, definition, json.Object([]), request.options("agent", "1"))
+///   == Ok(client.Complete("hello"))
 /// ```
 pub fn call(
   endpoint: requests.Endpoint,
@@ -1156,7 +1275,9 @@ pub fn call(
 /// ## Examples
 ///
 /// ```gleam
-/// // mrtr.responses(client.continuation_required(continuation), explicit_inputs)
+/// let required = client.continuation_required(continuation)
+/// mrtr.responses(required, explicit_inputs)
+/// // -> Only the latest suspension's exact input keys can be admitted.
 /// ```
 pub fn continuation_required(
   continuation: Continuation(output),
@@ -1172,7 +1293,10 @@ pub fn continuation_required(
 /// ## Examples
 ///
 /// ```gleam
-/// // client.resume(continuation, validated_responses, options)
+/// let required = client.continuation_required(continuation)
+/// let assert Ok(responses) = mrtr.responses(required, explicit_inputs)
+/// client.resume(continuation, responses, original_options)
+/// // -> A new Complete, ToolFailed or InputRequired attempt, or a request error.
 /// ```
 pub fn resume(
   continuation: Continuation(output),
@@ -1209,6 +1333,9 @@ pub fn resume(
   )
 }
 
+// Each attempt builds a fresh envelope from the retained call contract. The
+// result discriminator selects completion or suspension before output decoding;
+// a tool failure is visible data and need not satisfy the successful schema.
 fn perform_call(
   endpoint: requests.Endpoint,
   name: String,
@@ -1462,6 +1589,8 @@ pub fn cancel(client: Client, id: Id) -> Nil {
   process.send(client.subject, CancelRaw(id))
 }
 
+// The caller monitors the actor while the actor monitors this reply channel
+// ownership. Losing either side settles or cancels the same admitted request.
 fn raw_exchange(
   client: Client,
   outbound: requests.Outbound,
@@ -1532,6 +1661,9 @@ fn receive_raw(
   }
 }
 
+// Admission validates the complete envelope and live caller before allocating
+// a peer id. Keeping original_id beside that id lets the endpoint hide transport
+// renumbering from the application and its subscription observer.
 fn handle_raw_request(
   state: State,
   outbound: requests.Outbound,
@@ -1613,6 +1745,8 @@ fn replace_request_id(value: JsonValue, id: Id) -> JsonValue {
   }
 }
 
+// Normal responses retire their caller monitor. A subscription instead must
+// prove acknowledgement and completion ordering before releasing its request.
 fn settle_answer(
   reply: Reply,
   outcome: Result(JsonValue, jsonrpc.RpcError),
@@ -1704,6 +1838,8 @@ fn route_notification(
   }
 }
 
+// Validate against the allocated peer id before restoring the caller's id.
+// Rewriting first would make an unrelated wire stream appear correlated.
 fn route_stream(
   state: State,
   id: Int,
@@ -1806,6 +1942,7 @@ fn map_object(
 
 /// A validated modern tools catalog and conservative cache freshness.
 pub type ToolListing {
+  /// The collected descriptors and conservative cache hint.
   ToolListing(
     /// Tools accepted by both schema compilation and endpoint binding policy.
     tools: List(protocol.ToolDescriptor),
@@ -1843,6 +1980,9 @@ pub fn list_tools_at(
   )
 }
 
+// Every page spends the original traversal deadline and page allowance.
+// Cache hints are combined conservatively rather than resetting freshness on
+// each newly received page.
 fn modern_list_pages(
   endpoint: requests.Endpoint,
   options: requests.Options,
@@ -1967,7 +2107,13 @@ fn admit_profile(
 
 /// A retained subscription worker borrowing a caller-owned native client.
 pub opaque type Listening {
-  Listening(run: weft.Detached(JsonValue, requests.Error), id: Id)
+  /// The retained scope whose outcome and retirement must be consumed.
+  Listening(
+    /// The retained worker scope; polling or cancellation consumes its lifetime.
+    run: weft.Detached(JsonValue, requests.Error),
+    /// The request identity used for correlation or cancellation.
+    id: Id,
+  )
 }
 
 /// The observed lifetime of one retained native subscription.
@@ -1976,10 +2122,16 @@ pub type ListenStatus {
   ListeningPending
 
   /// The peer gracefully completed the subscription.
-  ListeningCompleted(response: JsonValue)
+  ListeningCompleted(
+    /// The final correlated subscription response.
+    response: JsonValue,
+  )
 
   /// The subscription failed and its worker has been retired.
-  ListeningFailed(error: requests.Error)
+  ListeningFailed(
+    /// The failed stage's typed verdict.
+    error: requests.Error,
+  )
 
   /// Every outcome and worker retirement has already been consumed.
   ListeningDrained
@@ -2057,6 +2209,9 @@ pub fn cancel_listening(listening: Listening) -> Result(Nil, requests.Error) {
   drain_listening(listening.run)
 }
 
+// Cancellation returns only after the retained scope is drained. Pulls can
+// consume a final outcome before AllDelivered, so consuming one outcome alone
+// is insufficient evidence that the worker has retired.
 fn drain_listening(
   run: weft.Detached(JsonValue, requests.Error),
 ) -> Result(Nil, requests.Error) {

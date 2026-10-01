@@ -1,6 +1,20 @@
 //// Schema compilation validates keyword shapes and indexes resource identities.
 //// References resolve exclusively against this immutable registry; a schema never
 //// gains network authority from a URI embedded in an untrusted tool definition.
+////
+//// ## Flow
+////
+//// new -> new_with_resources bounds input and prepares the explicit offline
+//// registry. index -> index_node -> index_effective -> index_new checks keyword
+//// shapes and indexes resource ids, anchors and enabled vocabularies. children
+//// traverses recognized subschemas; load_references -> ensure_resource -> resolve
+//// then compiles additional targets reachable through references.
+////
+//// Build.indexed identifies each location by base URI and pointer, so a cyclic
+//// reference graph cannot make compilation revisit locations indefinitely. The
+//// shared remaining allowance still limits newly reached locations. resolve ->
+//// pointer walks data under an indexed resource; no URI can initiate a fetch.
+//// array_schema preserves a compiled element's absolute identity when nesting it.
 
 import gleam/dict.{type Dict}
 import gleam/int
@@ -18,6 +32,7 @@ import gleam_mcp/json.{type JsonValue}
 
 /// A schema location and the resource base inherited by references beneath it.
 pub type Node {
+  /// The schema location and effective resource identity used during traversal.
   Node(
     /// The schema at this location.
     schema: JsonValue,
@@ -48,10 +63,16 @@ pub type Document {
 /// Compilation failures distinguish malformed schemas from unsupported dialects.
 pub type Error {
   /// A malformed keyword, ambiguous identity, or unresolved reference.
-  Invalid(reason: String)
+  Invalid(
+    /// The failed schema contract or unresolved resource identity.
+    reason: String,
+  )
 
   /// A dialect absent from the explicitly supplied offline registry.
-  Dialect(name: String)
+  Dialect(
+    /// The unsupported dialect identifier, retained without fetching it.
+    name: String,
+  )
 
   /// The document exceeded the compilation work allowance.
   Limit
@@ -126,6 +147,9 @@ pub fn new_with_resources(
   Ok(document)
 }
 
+// Indexing ordinary subschemas is not enough: a reference may target a value
+// inside an unknown annotation. Compile that reachable target too, using only
+// resources already supplied in the offline registry.
 fn load_references(
   state: Build,
   available: List(#(String, JsonValue)),
@@ -195,6 +219,8 @@ pub fn bounded(
   }
 }
 
+// Object keys count as input as well as values, and duplicate names are
+// refused even for hand-built JsonValue inputs that bypassed the parser.
 fn bounded_value(
   data: JsonValue,
   depth: Int,
@@ -272,6 +298,9 @@ fn index_effective(
   }
 }
 
+// The effective base, vocabulary and location are admitted together. This
+// keeps later evaluation from resolving a reference under a different dialect
+// or accepting an ambiguous resource identity.
 fn index_new(
   original: Node,
   node: Node,
@@ -376,6 +405,8 @@ pub fn child(parent: Node, schema: JsonValue, suffix: String) -> Node {
   Node(schema, parent.base, parent.location <> suffix)
 }
 
+// Traversal follows keywords in their enabled vocabulary. Unknown annotations
+// remain data until a reference explicitly makes their value a schema target.
 fn children(node: Node, vocabularies: List(String)) -> List(Node) {
   let singles = [
     "items",
@@ -453,6 +484,9 @@ pub fn resolve(
   from: Node,
   reference: String,
 ) -> Result(Node, Error) {
+  // Resolve the absolute URI against the admitted resource and anchor maps.
+  // Failure means unavailable offline data, never permission to fetch that URI.
+
   use absolute <- result.try(absolute(from.base, reference))
   let resource = strip_fragment(absolute)
   let fragment = string.split(absolute, "#") |> value.at(1) |> result.unwrap("")
@@ -799,6 +833,9 @@ fn invalid(keyword: String) -> Result(a, Error) {
 /// // document.array_schema(compiled) preserves compiled.entry.base for local references.
 /// ```
 pub fn array_schema(document: Document) -> JsonValue {
+  // Embedding a root changes its position but must not change the resource
+  // its local references name. Assign that resource an absolute id before wrapping.
+
   case document.root {
     json.Bool(_) ->
       json.Object([#("type", json.String("array")), #("items", document.root)])

@@ -16,9 +16,8 @@
 //// - Object fields keep their textual order. A duplicated key within one
 ////   object is corruption: decoders disagree on duplicate-key precedence
 ////   (first- versus last-occurrence wins), so at a durability boundary a
-////   document carrying duplicates has no single meaning — the parser
-////   rejects it rather than picking one. Data this module serialized
-////   never contains duplicates, so nothing well-formed is lost.
+////   document carrying duplicates has no single meaning, so the parser rejects
+////   it. Hand-built values remain the caller's responsibility.
 //// - Containers (objects and arrays) may nest at most `max_depth` levels
 ////   deep. Deeper input — cheap to fabricate adversarially, one `[` per
 ////   level — is a corruption report, never a runaway recursion that
@@ -26,6 +25,20 @@
 //// - Strings must be valid JSON: unescaped control characters are
 ////   rejected, `\uXXXX` escapes are decoded including surrogate pairs, and
 ////   lone surrogates are rejected.
+////
+//// ## Flow
+////
+//// parse -> parse_value dispatches on the next byte. Objects follow parse_members
+//// -> parse_member -> check_unique_key; arrays follow parse_items. String decoding
+//// uses parse_string_body -> parse_escape -> parse_unicode_escape, and numeric
+//// decoding uses parse_number -> parse_fraction -> parse_exponent -> finish_float.
+//// parse requires the remaining input to be whitespace after one complete value.
+////
+//// to_string -> build accumulates StringTree fragments and flattens once. String
+//// encoding follows build_string -> escape_runs, retaining clean UTF-8 runs rather
+//// than allocating one fragment per character. Parse limits apply at this boundary;
+//// hand-built JsonValue constructors still let a caller create deeper containers or
+//// duplicate fields, and serialization doesn't revalidate those values.
 
 import gleam/bit_array
 import gleam/bool
@@ -60,22 +73,40 @@ pub const max_depth = 256
 ///   infinity), so serialization is always well-formed JSON.
 pub type JsonValue {
   /// A JSON object as an ordered field list.
-  Object(fields: List(#(String, JsonValue)))
+  Object(
+    /// The ordered field list; parse rejects duplicate names.
+    fields: List(#(String, JsonValue)),
+  )
 
   /// A JSON array.
-  Array(items: List(JsonValue))
+  Array(
+    /// The elements in wire order.
+    items: List(JsonValue),
+  )
 
   /// A JSON string.
-  String(value: String)
+  String(
+    /// Decoded Unicode text; serialization escapes control characters.
+    value: String,
+  )
 
   /// A JSON number with no fraction or exponent part. Arbitrary precision.
-  Int(value: Int)
+  Int(
+    /// An arbitrary-precision integer on the Erlang target.
+    value: Int,
+  )
 
   /// A JSON number with a fraction or exponent part. Always finite.
-  Float(value: Float)
+  Float(
+    /// A finite floating-point value, after any parse-time rounding.
+    value: Float,
+  )
 
   /// A JSON boolean.
-  Bool(value: Bool)
+  Bool(
+    /// The wire boolean itself, rather than an application flag.
+    value: Bool,
+  )
 
   /// The JSON null.
   Null
@@ -250,9 +281,14 @@ fn escape_of(byte: Int) -> String {
   }
 }
 
-// The reference encoder, one codepoint at a time. It is the fallback for
-// the impossible slice failure above and the oracle the tests compare the
-// run-based encoder against.
+/// Encodes one code point at a time as the test oracle and slice-error fallback.
+///
+/// ## Examples
+///
+/// ```gleam
+/// assert json.build_string_by_codepoint("hello")
+///   |> string_tree.to_string == "\"hello\""
+/// ```
 @internal
 pub fn build_string_by_codepoint(text: String) -> StringTree {
   text

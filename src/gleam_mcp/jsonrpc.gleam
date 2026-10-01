@@ -15,6 +15,17 @@
 //// and error `data` are carried raw for the layer above to interpret.
 //// Every decoder is total: hostile input settles as a `MessageFault`,
 //// never a crash.
+////
+//// ## Flow
+////
+//// decode_modern -> json.parse -> decode_value checks the version and selects an
+//// uncorrelated error, a call, or a response. decode_call distinguishes requests
+//// from notifications by id presence; decode_response enforces one result or error.
+//// The legacy decode path requires a correlated envelope. request, notification,
+//// response and error_response build values; stdio or HTTP owns their byte framing.
+////
+//// IdInt(1) and IdString("1") stay distinct through correlation. A decoder refusal
+//// is data; the transport owner determines whether that refusal closes a channel.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -36,16 +47,30 @@ pub const version = "2.0"
 /// it is a `MessageFault` at the boundary instead.
 pub type Id {
   /// An integer id (what this client mints).
-  IdInt(value: Int)
+  IdInt(
+    /// The exact integer identity; it never equals a string containing its digits.
+    value: Int,
+  )
 
   /// A string id (accepted from the peer, echoed back verbatim).
-  IdString(value: String)
+  IdString(
+    /// The exact peer-selected text, echoed without conversion.
+    value: String,
+  )
 }
 
 /// The error member of a failed response: JSON-RPC's `{code, message,
 /// data?}` object. `data` is carried raw and uninterpreted.
 pub type RpcError {
-  RpcError(code: Int, message: String, data: Option(JsonValue))
+  /// The structured protocol refusal, with optional uninterpreted detail.
+  RpcError(
+    /// The JSON-RPC error code.
+    code: Int,
+    /// The untrusted peer diagnostic.
+    message: String,
+    /// Optional error detail preserved for the consumer.
+    data: Option(JsonValue),
+  )
 }
 
 /// One decoded inbound message, discriminated the way JSON-RPC 2.0
@@ -54,36 +79,65 @@ pub type RpcError {
 pub type Inbound {
   /// A response to a request we sent: the echoed id plus either the raw
   /// `result` value or the typed error object.
-  Response(id: Id, outcome: Result(JsonValue, RpcError))
+  Response(
+    /// The exact request identity used by the transport's correlation policy.
+    id: Id,
+    /// A raw success value or structured protocol error.
+    outcome: Result(JsonValue, RpcError),
+  )
 
-  /// A server-initiated request. This client answers method-not-found in
-  /// a later slice, but the envelope decodes today so nothing hostile can
-  /// hide inside one.
-  ServerRequest(id: Id, method: String, params: Option(JsonValue))
+  /// An incoming request, with authority and method policy left to the caller.
+  /// The native client refuses server-initiated methods; the server dispatcher
+  /// uses this same envelope shape for admitted client requests.
+  ServerRequest(
+    /// The exact request identity used by the transport's correlation policy.
+    id: Id,
+    /// The wire operation name, without granting authority to execute it.
+    method: String,
+    /// The uninterpreted parameters, absent when omitted on the wire.
+    params: Option(JsonValue),
+  )
 
   /// A server-initiated notification: fire and forget, no id to answer.
-  Notification(method: String, params: Option(JsonValue))
+  Notification(
+    /// The wire operation name, without granting authority to execute it.
+    method: String,
+    /// The uninterpreted parameters, absent when omitted on the wire.
+    params: Option(JsonValue),
+  )
 }
 
 /// Why an inbound message was refused. Both constructors are plain data:
-/// a fault is the settled outcome of decoding hostile input, never a
-/// crash and never a reason to kill a connection process.
+/// a fault is the settled outcome of decoding hostile input. The transport
+/// decides whether its channel policy permits continued processing.
 pub type MessageFault {
   /// The text is not a single well-formed JSON document.
-  MalformedMessage(report: CorruptionReport)
+  MalformedMessage(
+    /// The total JSON parser's corruption report.
+    report: CorruptionReport,
+  )
 
   /// The document parsed but is not a JSON-RPC 2.0 message; `reason`
   /// names what a well-formed one would have carried.
-  BadMessage(reason: String)
+  BadMessage(
+    /// The envelope contract that failed.
+    reason: String,
+  )
 }
 
 /// Modern response decoding retains an error that has no correlatable id.
 pub type ModernInbound {
   /// An ordinary request, notification, or correlated response.
-  Correlated(message: Inbound)
+  Correlated(
+    /// The admitted envelope whose id and payload remain unchanged.
+    message: Inbound,
+  )
 
   /// An error whose request could not be identified; its id is omitted.
-  UncorrelatedError(error: RpcError)
+  UncorrelatedError(
+    /// A peer error with no request id to correlate.
+    error: RpcError,
+  )
 }
 
 /// Decodes a modern envelope already parsed by its transport boundary.
