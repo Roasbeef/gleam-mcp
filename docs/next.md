@@ -58,12 +58,46 @@ Its fresh public Linux clone passed the full gate and fifty unchanged HTTP
 startup suites, including 150 expected authentication refusals. No live
 Jevelin inference has been exercised.
 
-Loom extraction `6de0188` pins the same SDK. Its full local gate passed at
-source/dependency baseline `7b8cd39f9`; final hosted and jailed checks remain
-separate. The preceding `589a2cd` passed the required Linux gate and advisory
-macOS package check, while macOS e2e still failed at `worktree_diff_test.gleam:95`.
-That assertion and GitFailed(128) diagnostic also fail on exact base main
-`01f14ef8`. Read consumer evidence at the commit and CI run that produced it.
+Loom extraction `6de0188` pinned SDK `686955fc`. Its later published head
+`a102a35232436cde70e0f3ea99c8c810daa7f156`, rebased on `7b1c662`, passed
+exact-head hosted CI in
+[run 36795638550](https://github.com/Roasbeef/loom/actions/runs/36795638550)
+and all six Linux signoff lanes. That evidence is historical: the newer
+`5aad549bd17a34dd07f6549695ef1430b0efff5f` rebase on `275efc42` has its own
+CI and signoff pending. Consumer release verification remains separate.
+The earlier `589a2cd` passed its required Linux gate and advisory macOS package
+check, while macOS e2e failed at `worktree_diff_test.gleam:95`. That assertion
+and GitFailed(128) also failed on its exact base main `01f14ef8`; this records
+the earlier comparison rather than a current failure claim.
+
+## Source reading guide
+
+The literate source pass is based on `0146dd057816433f6a02c156a7cce3ecc0206661`.
+[Architecture](architecture.md) follows typed calls, transport custody and
+offline schema evaluation with explicit bounds and limitations.
+[Principles](principles.md) records the standalone package's comment and
+navigation conventions. Every application Gleam module has a `Flow` section;
+client, stdio coordinator, HTTP stream and subscription admission include
+transition tables. Typed opaque boundaries document their retained fields.
+The native client's three option builders now follow its State/Msg/Phase
+contracts; other grouped implementation sections retain their own types.
+
+The source reading pass passed the complete local `make check` gate using
+Gleam 1.18.1 and Erlang/OTP 29. Its own exit status was zero: 232 unit tests,
+139 linter tests, five tooling checks, nine native stdio tests and 30 native
+HTTP/TLS tests. The linter reported zero errors and 112 warnings. Documentation
+HTML also rendered successfully with `gleam docs build`; its dependency checks
+reported existing deprecated Header aliases in Gramps and Mist.
+
+An earlier sandboxed run refused local socket binding. The first run with
+listener access passed stdio but reported eleven HTTP fixture READY timeouts
+and one TLS subprocess startup timeout. An isolated unchanged HTTP test and
+the fresh full gate then passed. The startup-timeout cause remains unconfirmed;
+no assertion, deadline, runtime code or dependency was changed to obtain the
+passing run. Executable-token comparison preserves all 34 application Gleam
+modules after reversing the three recorded declaration moves and normalizing
+formatter trailing commas. The three Erlang adapters preserve every executable
+line; their changes are comments only.
 
 ## Rulings already made
 

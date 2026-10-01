@@ -119,6 +119,15 @@ The [JSON Schema corpus record](test/fixtures/json_schema/UPSTREAM.md) lists
 required-suite coverage, optional coverage and supported regex forms. Schemas
 compile offline; references don't trigger automatic network access.
 
+## Read the implementation
+
+The [architecture guide](docs/architecture.md) follows a typed call through
+client, server, schema validation and transport custody. The
+[design and literate Gleam principles](docs/principles.md) explain why those
+boundaries exist and how the source comments expose their ordering. Start
+with `tool`, `codec` and `request`, then use each module's `Flow` section to
+follow the client and its matching server path.
+
 ## Development
 
 `make check` runs formatting, warning-free application compilation, unit and

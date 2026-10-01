@@ -1,8 +1,11 @@
 # Gleam MCP
 
 Read `docs/next.md` before planning work and `docs/gleam-style.md` before
-writing code. This repository inherits Loom's literate Gleam style, total
-decoders, caller-owned effects, and house-rule linter.
+writing code. [Architecture](docs/architecture.md) supplies a source reading
+path and custody map; [principles](docs/principles.md) applies the literate
+Gleam rules to this standalone package. This repository inherits Loom's
+literate Gleam style, total decoders, caller-owned effects, and house-rule
+linter.
 
 ## Working here
 
@@ -10,8 +13,12 @@ Use Gleam >= 1.18 and Erlang/OTP >= 29. `make check` runs formatting, a
 warning-free build, tests, the copied custom linter, and documentation checks.
 `make fmt` formats the application and linter. Verify commands by their own
 exit status. Public functions include examples; module documentation explains
-ownership, transitions and failure behavior. Comments are complete sentences
-with a blank line above them. Chain fallible steps with `use` and `result.try`.
+ownership, transitions and failure behavior. Large modules include a `Flow`
+section naming the execution path. State and message types precede their
+implementation section, and critical lifetime machines include transition
+tables. Qualified domain calls expose ownership; helpers name actual protocol
+work rather than wrapping another call for cosmetic structure. Comments are
+complete sentences with a blank line above them. Chain fallible steps with `use` and `result.try`.
 Use opaque smart constructors for invariants, and domain variants for flags.
 
 The application is an Erlang runtime package. Loom-specific rules in the
