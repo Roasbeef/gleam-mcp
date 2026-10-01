@@ -28,7 +28,7 @@ not create dependencies here. The pure wire modules remain free of effects;
 `internal/ffi_*.gleam` with the reason no maintained Gleam library suffices.
 Process ownership and deadline machinery use weft when needed.
 
-The copied linter retains Loom's R0 through R11 rules and promotion levels.
+The copied linter retains Loom's R0 through R12 rules and promotion levels.
 R0, R2, R4 and R10 apply to root source. R6 recognizes Loom's
 `packages/core`, `packages/machine` and `packages/prompt` layout; the explicit
 source gate owns pure-module enforcement in this standalone package.
