@@ -196,7 +196,7 @@ class NativeStdio(unittest.TestCase):
             negatives = [
                 (positive.replace('definition, 1,', 'definition, "wrong",'), "Type mismatch"),
                 (positive.replace('Result(client.CallOutcome(String)', 'Result(client.CallOutcome(Int)'), "Type mismatch"),
-                ('import gleam_mcp/tool\npub fn forge() { tool.Tool() }\n', "Unknown module value"),
+                ('import gleam_mcp/tool\npub fn forge() { tool.Tool() }\n', "Use of private value"),
             ]
             for source, expected in negatives:
                 with self.subTest(diagnostic=expected, source=source):

@@ -12,7 +12,7 @@ and owned subscriptions. Resources, prompts, and client providers are separate
 optional features; see [the feature scope](docs/extensions.md) and
 [resources/prompts issue #1](https://github.com/Roasbeef/gleam-mcp/issues/1).
 
-Use Gleam >= 1.18 and Erlang/OTP >= 29. Consume the package through an exact
+Use Gleam >= 1.19 and Erlang/OTP >= 29. Consume the package through an exact
 Git commit dependency, as [Jevelin MCP](https://github.com/Roasbeef/jevelin-mcp)
 does. The runtime targets Erlang; its copied development linter isn't a
 runtime dependency. Loom keeps its capability generator, schema planner, and

@@ -9,7 +9,7 @@ linter.
 
 ## Working here
 
-Use Gleam >= 1.18 and Erlang/OTP >= 29. `make check` runs formatting, a
+Use Gleam >= 1.19 and Erlang/OTP >= 29. `make check` runs formatting, a
 warning-free build, tests, the copied custom linter, and documentation checks.
 `make fmt` formats the application and linter. Verify commands by their own
 exit status. Public functions include examples; module documentation explains
