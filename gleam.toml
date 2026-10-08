@@ -8,7 +8,7 @@ gleam = ">= 1.18.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
-weft = "== 0.4.5"
+weft = "== 0.4.6"
 gleam_regexp = ">= 1.0.0 and < 2.0.0"
 gleam_http = ">= 4.0.0 and < 5.0.0"
 glisten = { git = "https://github.com/Roasbeef/glisten.git", ref = "3eb785919be0736da0a20732a56275dce0132327" }
