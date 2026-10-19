@@ -66,8 +66,10 @@ body that is sent. `x-mcp-header` annotations compile into a checked header
 plan; malformed plans fail client admission. Server mirror validation precedes
 handler admission. Unsafe string values use the specified Base64 sentinel.
 
-The listener binds loopback and requires the host to choose an admission
-policy. A present Origin must match the explicit allowlist, including before
+The listener binds loopback by default and requires the host to choose an
+admission policy. `with_listen` can bind one literal IP address instead, but
+refuses it under `LocalUnauthenticated`, so a listener reachable off-host
+always authenticates. A present Origin must match the explicit allowlist, including before
 routing and authentication. Origin validation and authentication are separate
 checks. Descriptive client identity isn't authentication.
 

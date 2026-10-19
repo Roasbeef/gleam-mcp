@@ -5,9 +5,25 @@
 //// Request bodies use unambiguous Content-Length framing up to eight MiB.
 //// Transfer-Encoding is refused before Mist can buffer a declared HTTP chunk.
 ////
+//// ## Listen interface
+////
+//// A new Config binds 127.0.0.1. with_listen(config, Interface(address)) binds
+//// one literal IPv4 or IPv6 address, for example a pod interface or 0.0.0.0, but
+//// only under Authenticate. LocalUnauthenticated is the explicit choice of local
+//// access, so combining it with Interface is refused when the Config is built
+//// rather than discovered at bind time. To bind 127.0.0.1 use Loopback, because
+//// Interface("127.0.0.1") under LocalUnauthenticated is refused too. A host
+//// name, malformed address or IPv6 zone id (`%en0`) is refused by with_listen,
+//// because Glisten would otherwise panic or drop the zone. Only the syntax is
+//// checked there: an address this host doesn't own, such as 203.0.113.7, passes
+//// with_listen and fails in start as Error(actor.StartError). On Linux, `::`
+//// is dual-stack and also accepts IPv4. TLS stays with a front proxy; an
+//// exposed listener still relies on the caller's check.
+////
 //// ## Flow
 ////
-//// start_server -> start creates a loopback Mist listener. Each request follows
+//// start_server -> start creates a Mist listener on the configured Listen
+//// interface, loopback unless with_listen chose a literal address. Each request follows
 //// handle -> admit before routing. post -> read_body -> body_framing bounds body
 //// collection, then validate_request -> http.validate -> route -> custom_headers
 //// checks body/header agreement before stream can admit application work.
@@ -46,6 +62,7 @@ import gleam/string_tree
 import gleam_mcp/http
 import gleam_mcp/http_headers
 import gleam_mcp/internal/ffi_http_socket as socket_native
+import gleam_mcp/internal/ffi_inet as inet
 import gleam_mcp/json.{type JsonValue}
 import gleam_mcp/jsonrpc
 import gleam_mcp/schema
@@ -68,6 +85,18 @@ pub type Admission {
   )
 }
 
+/// The interface a listener binds; `with_listen` keeps host names from Glisten.
+pub type Listen {
+  /// Bind 127.0.0.1, reachable only from the same host.
+  Loopback
+
+  /// Bind one literal IPv4 or IPv6 address; `with_listen` requires Authenticate.
+  Interface(
+    /// An IP literal such as `10.0.0.5`, `0.0.0.0` or `::1`; never a host name.
+    address: String,
+  )
+}
+
 /// Validated listener settings; the default interface is always loopback.
 pub opaque type Config {
   /// The settings admitted together before any transport effect.
@@ -82,6 +111,8 @@ pub opaque type Config {
     admission: Admission,
     /// The byte cap used before body collection and during refusal drains.
     limit: Int,
+    /// The interface to bind; Interface is admitted only with Authenticate.
+    listen: Listen,
   )
 }
 
@@ -89,7 +120,7 @@ pub opaque type Config {
 pub type Dispatcher =
   fn(JsonValue, fn(JsonValue) -> Nil) -> Option(JsonValue)
 
-/// Constructs a loopback listener with an explicit Origin allowlist and policy.
+/// Constructs a loopback listener (see `with_listen`) with an explicit Origin allowlist and policy.
 ///
 /// ## Examples
 ///
@@ -107,8 +138,43 @@ pub fn new(
     && !string.contains(path, "?")
     && !string.contains(path, "#")
   {
-    True -> Ok(Config(port, path, allowed_origins, admission, 8_388_608))
+    True ->
+      Ok(Config(port, path, allowed_origins, admission, 8_388_608, Loopback))
     False -> Error("invalid HTTP listener port or endpoint path")
+  }
+}
+
+/// Chooses the interface to bind, refusing any unauthenticated exposure.
+///
+/// `Interface` needs `Authenticate` admission and a literal IPv4 or IPv6
+/// address without a zone id. Use `Loopback` rather than `Interface("127.0.0.1")`
+/// for local access. This checks syntax only; `start` still fails for an
+/// address the host doesn't own. Refusal returns an Error and leaves the original Config unchanged.
+///
+/// ## Examples
+///
+/// `with_listen(config, Interface("0.0.0.0"))` is Ok under `Authenticate` and
+/// Error under `LocalUnauthenticated`; `Interface("localhost")` is Error.
+pub fn with_listen(config: Config, listen: Listen) -> Result(Config, String) {
+  case listen, config.admission {
+    Loopback, _ -> Ok(Config(..config, listen: Loopback))
+    Interface(_), LocalUnauthenticated ->
+      Error("a non-loopback listener requires Authenticate admission")
+    Interface(address), Authenticate(_) ->
+      case string.contains(address, "%"), inet.is_literal(address) {
+        True, _ -> Error("listen address must not carry an IPv6 zone id")
+        False, True -> Ok(Config(..config, listen: Interface(address)))
+        False, False ->
+          Error("listen address must be a literal IPv4 or IPv6 address")
+      }
+  }
+}
+
+// Loopback names the address Glisten maps to its loopback option.
+fn listen_address(config: Config) -> String {
+  case config.listen {
+    Loopback -> "127.0.0.1"
+    Interface(address) -> address
   }
 }
 
@@ -143,7 +209,7 @@ pub fn start(
   input_schema: fn(String) -> Option(schema.Schema),
 ) -> Result(actor.Started(Supervisor), actor.StartError) {
   mist.new(fn(req) { handle(config, dispatch, input_schema, req) })
-  |> mist.bind("127.0.0.1")
+  |> mist.bind(listen_address(config))
   |> mist.port(config.port)
   |> mist.start
 }

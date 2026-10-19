@@ -93,8 +93,13 @@ admission and drains admitted work; cancellation joins owned handler scopes.
 The modern runtime keeps subscriptions live while other requests complete.
 
 For HTTP, construct `server_http.new(port, "/mcp", allowed_origins, admission)`
-and call `server_http.start_server`. The listener binds `127.0.0.1`; choose
-`Authenticate(check)` or explicitly select `LocalUnauthenticated`. Every
+and call `server_http.start_server`. The listener binds `127.0.0.1` by default;
+choose `Authenticate(check)` or explicitly select `LocalUnauthenticated`. To
+serve other hosts, pass `server_http.with_listen(config, Interface("10.0.0.5"))`.
+`Interface` takes a literal IPv4 or IPv6 address (`0.0.0.0` binds every IPv4
+interface) and is refused under `LocalUnauthenticated`, so an exposed listener
+always runs behind `Authenticate`. Host names and malformed addresses are
+refused as well. `Listen` is closed: `Loopback | Interface(address)`. Every
 present Origin must match the allowlist. Remote TLS deployments use a front
 proxy with their host admission policy. The client supports HTTPS with peer
 and hostname verification. Server request bodies require unambiguous

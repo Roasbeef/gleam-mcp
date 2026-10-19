@@ -317,6 +317,80 @@ class NativeAdmissionHttp(unittest.TestCase):
         self.assertFalse(select.select([self.child.stdout], [], [], 0.1)[0],
                          "discarding an unauthorized body admitted a callback")
 
+def external_address():
+    """Returns this host's non-loopback IPv4 address, or None when it has none."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            # Connecting a datagram socket selects a route without sending.
+            probe.connect(("192.0.2.1", 9))
+            address = probe.getsockname()[0]
+        except OSError:
+            return None
+    return None if address.startswith("127.") else address
+
+
+EXTERNAL = external_address()
+
+
+def require_external():
+    """Skips with a reason, except on CI, where the probe must really run."""
+    if EXTERNAL is None:
+        reason = "no non-loopback interface to probe"
+        print(f"SKIP: {reason}", flush=True)
+        if os.environ.get("CI"):
+            raise AssertionError(reason + " on CI")
+        raise unittest.SkipTest(reason)
+    return EXTERNAL
+
+
+def reachable(address, port):
+    try:
+        socket.create_connection((address, port), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
+class NativeLoopbackListen(unittest.TestCase):
+    fixture_name = "server"
+    setUp = NativeHttp.setUp
+    tearDown = NativeHttp.tearDown
+
+    def test_default_listener_binds_loopback_only(self):
+        self.assertTrue(reachable("127.0.0.1", self.port))
+        address = require_external()
+        self.assertFalse(reachable(address, self.port),
+                         "the default listener accepted a non-loopback connection")
+
+
+class NativeInterfaceListen(unittest.TestCase):
+    fixture_name = "server_interface"
+    setUp = NativeHttp.setUp
+    tearDown = NativeHttp.tearDown
+
+    def request(self, address, token):
+        connection = http.client.HTTPConnection(address, self.port, timeout=5)
+        incoming = headers()
+        if token:
+            incoming["Authorization"] = token
+        connection.request("POST", "/mcp", json.dumps(envelope()).encode(), incoming)
+        return connection, connection.getresponse()
+
+    def test_interface_listener_authenticates_on_every_address(self):
+        for address in ["127.0.0.1", require_external()]:
+            with self.subTest(address=address):
+                connection, response = self.request(address, None)
+                self.assertEqual(response.status, 401)
+                response.read()
+                connection.close()
+                connection, response = self.request(address, "Bearer fixture-token")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode().split("data: ")[1])["id"], 7)
+                connection.close()
+                self.lines.until("WORKER_STARTED")
+                self.lines.until("WORKER_DOWN")
+
+
 class PythonPeer(unittest.TestCase):
     def client(self, mode, timeout=2000, fixture="client"):
         observed = []
