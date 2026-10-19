@@ -11,9 +11,14 @@
 //// one literal IPv4 or IPv6 address, for example a pod interface or 0.0.0.0, but
 //// only under Authenticate. LocalUnauthenticated is the explicit choice of local
 //// access, so combining it with Interface is refused when the Config is built
-//// rather than discovered at bind time. A host name or malformed address is
-//// refused too, because Glisten would otherwise panic during start. TLS stays
-//// with a front proxy; an exposed listener still relies on the caller's check.
+//// rather than discovered at bind time. To bind 127.0.0.1 use Loopback, because
+//// Interface("127.0.0.1") under LocalUnauthenticated is refused too. A host
+//// name, malformed address or IPv6 zone id (`%en0`) is refused by with_listen,
+//// because Glisten would otherwise panic or drop the zone. Only the syntax is
+//// checked there: an address this host doesn't own, such as 203.0.113.7, passes
+//// with_listen and fails in start as Error(actor.StartError). On Linux, `::`
+//// is dual-stack and also accepts IPv4. TLS stays with a front proxy; an
+//// exposed listener still relies on the caller's check.
 ////
 //// ## Flow
 ////
@@ -80,7 +85,7 @@ pub type Admission {
   )
 }
 
-/// The interface a listener binds, closed so no host name can reach Glisten.
+/// The interface a listener binds; `with_listen` keeps host names from Glisten.
 pub type Listen {
   /// Bind 127.0.0.1, reachable only from the same host.
   Loopback
@@ -142,7 +147,9 @@ pub fn new(
 /// Chooses the interface to bind, refusing any unauthenticated exposure.
 ///
 /// `Interface` needs `Authenticate` admission and a literal IPv4 or IPv6
-/// address. Refusal returns an Error and leaves the original Config unchanged.
+/// address without a zone id. Use `Loopback` rather than `Interface("127.0.0.1")`
+/// for local access. This checks syntax only; `start` still fails for an
+/// address the host doesn't own. Refusal returns an Error and leaves the original Config unchanged.
 ///
 /// ## Examples
 ///
@@ -154,9 +161,11 @@ pub fn with_listen(config: Config, listen: Listen) -> Result(Config, String) {
     Interface(_), LocalUnauthenticated ->
       Error("a non-loopback listener requires Authenticate admission")
     Interface(address), Authenticate(_) ->
-      case inet.is_literal(address) {
-        True -> Ok(Config(..config, listen: Interface(address)))
-        False -> Error("listen address must be a literal IPv4 or IPv6 address")
+      case string.contains(address, "%"), inet.is_literal(address) {
+        True, _ -> Error("listen address must not carry an IPv6 zone id")
+        False, True -> Ok(Config(..config, listen: Interface(address)))
+        False, False ->
+          Error("listen address must be a literal IPv4 or IPv6 address")
       }
   }
 }

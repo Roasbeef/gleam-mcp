@@ -1,7 +1,8 @@
 //// Glisten panics on an unparsable interface, and its own parser is private.
 //// Neither stdlib nor gleam_erlang decodes textual IPv4 or IPv6 addresses.
 //// This binding exposes OTP's strict literal parser so server_http can refuse
-//// a malformed address as a value before any listener starts.
+//// syntactically malformed address as a value before any listener starts. It
+//// can't tell whether the host owns the address; start reports that failure.
 ////
 //// ## Flow
 ////

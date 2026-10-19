@@ -20,6 +20,13 @@ pub fn interface_requires_authentication_test() {
     |> result.is_error
   assert server_http.with_listen(config(LocalUnauthenticated), Interface("::1"))
     |> result.is_error
+
+  // Local access under LocalUnauthenticated is spelled Loopback.
+  assert server_http.with_listen(
+      config(LocalUnauthenticated),
+      Interface("127.0.0.1"),
+    )
+    |> result.is_error
 }
 
 pub fn loopback_is_always_admitted_test() {
@@ -52,4 +59,5 @@ pub fn interface_refuses_non_literal_addresses_test() {
   assert refused("256.0.0.1")
   assert refused("10.0.0.1:80")
   assert refused("not an address")
+  assert refused("fe80::1%en0")
 }
