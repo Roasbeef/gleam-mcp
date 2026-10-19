@@ -148,8 +148,9 @@ responses pass correlation and subscription policy before delivery. A lost
 final response leaves the execution outcome unknown. `listen`, `poll` and
 `cancel` retain and drain one subscription scope with its own socket.
 
-[server_http](../src/gleam_mcp/server_http.gleam) binds loopback and requires an
-explicit operator admission policy. Every present Origin must match the
+[server_http](../src/gleam_mcp/server_http.gleam) binds loopback by default
+and requires an explicit operator admission policy. `with_listen` may bind a
+literal IP address, but only under `Authenticate`. Every present Origin must match the
 allowlist before routing or authentication. Body collection admits only
 unambiguous Content-Length framing within eight MiB; Transfer-Encoding is
 refused before Mist can buffer a declared chunk. Standard and custom mirrors

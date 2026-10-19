@@ -115,7 +115,8 @@ local termination, not rollback of a remote effect. A live subscription
 must coexist with ordinary requests and map its allocated wire identifier
 back to the caller's handle consistently.
 
-HTTP binds loopback and requires an explicit admission policy. Present
+HTTP binds loopback by default and requires an explicit admission policy.
+A non-loopback `Interface` listener needs `Authenticate` and a literal IP. Present
 Origins and mirrored headers validate before effects. Gun verifies HTTPS
 peers and hostnames, disables retries and joins the actual connection owner
 before return.
