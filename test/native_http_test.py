@@ -329,6 +329,20 @@ def external_address():
     return None if address.startswith("127.") else address
 
 
+EXTERNAL = external_address()
+
+
+def require_external():
+    """Skips with a reason, except on CI, where the probe must really run."""
+    if EXTERNAL is None:
+        reason = "no non-loopback interface to probe"
+        print(f"SKIP: {reason}", flush=True)
+        if os.environ.get("CI"):
+            raise AssertionError(reason + " on CI")
+        raise unittest.SkipTest(reason)
+    return EXTERNAL
+
+
 def reachable(address, port):
     try:
         socket.create_connection((address, port), timeout=2).close()
@@ -344,9 +358,7 @@ class NativeLoopbackListen(unittest.TestCase):
 
     def test_default_listener_binds_loopback_only(self):
         self.assertTrue(reachable("127.0.0.1", self.port))
-        address = external_address()
-        if address is None:
-            self.skipTest("no non-loopback interface to probe")
+        address = require_external()
         self.assertFalse(reachable(address, self.port),
                          "the default listener accepted a non-loopback connection")
 
@@ -365,10 +377,7 @@ class NativeInterfaceListen(unittest.TestCase):
         return connection, connection.getresponse()
 
     def test_interface_listener_authenticates_on_every_address(self):
-        addresses = ["127.0.0.1"]
-        if external_address():
-            addresses.append(external_address())
-        for address in addresses:
+        for address in ["127.0.0.1", require_external()]:
             with self.subTest(address=address):
                 connection, response = self.request(address, None)
                 self.assertEqual(response.status, 401)
