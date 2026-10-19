@@ -35,7 +35,33 @@ pub fn server_auth(port: Int) {
   )
 }
 
+/// Boots the bearer-authenticated listener on every IPv4 interface.
+///
+/// ## Examples
+///
+/// `server_interface(8000)` binds 0.0.0.0 and accepts only the fixture token.
+pub fn server_interface(port: Int) {
+  server_with_listen(
+    port,
+    server_http.Authenticate(fn(headers) {
+      case list.key_find(headers, "authorization") {
+        Ok("Bearer fixture-token") -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }),
+    server_http.Interface("0.0.0.0"),
+  )
+}
+
 fn server_with_admission(port: Int, admission: server_http.Admission) {
+  server_with_listen(port, admission, server_http.Loopback)
+}
+
+fn server_with_listen(
+  port: Int,
+  admission: server_http.Admission,
+  listen: server_http.Listen,
+) {
   let admitted = process.new_subject()
   let assert Ok(input) =
     schema.new(
@@ -57,6 +83,7 @@ fn server_with_admission(port: Int, admission: server_http.Admission) {
     )
   let assert Ok(config) =
     server_http.new(port, "/mcp", ["http://allowed.example"], admission)
+  let assert Ok(config) = server_http.with_listen(config, listen)
   let assert Ok(_) =
     server_http.start(
       config,
