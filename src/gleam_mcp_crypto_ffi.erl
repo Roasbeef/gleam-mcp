@@ -9,6 +9,7 @@
 %% and system_time_ms read OTP's millisecond clocks; fault_key generates a
 %% cryptographically random 32-byte VM-lifetime secret in persistent_term.
 -module(gleam_mcp_crypto_ffi).
+-on_load(init_fault_key/0).
 
 -export([
     sha256/1,
@@ -45,12 +46,22 @@ monotonic_time_ms() ->
 system_time_ms() ->
     erlang:system_time(millisecond).
 
+init_fault_key() ->
+    _ = fault_key(),
+    ok.
+
 fault_key() ->
     case persistent_term:get({?MODULE, fault_key}, undefined) of
         Key when is_binary(Key) ->
             Key;
         undefined ->
-            Generated = crypto:strong_rand_bytes(32),
-            persistent_term:put({?MODULE, fault_key}, Generated),
-            Generated
+            global:trans({{?MODULE, fault_key}, self()}, fun() ->
+                case persistent_term:get({?MODULE, fault_key}, undefined) of
+                    Existing when is_binary(Existing) -> Existing;
+                    undefined ->
+                        Generated = crypto:strong_rand_bytes(32),
+                        persistent_term:put({?MODULE, fault_key}, Generated),
+                        Generated
+                end
+            end)
     end.

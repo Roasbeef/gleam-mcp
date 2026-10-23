@@ -355,17 +355,39 @@ pub fn initialized_notification_gates_subsequent_requests_and_recovers_expired_s
           process.send(events, ResponseStatus(404, []))
           process.send(events, ResponseEnd)
         }
-        False, False, False -> {
-          process.send(order, "tools/list:recovered")
-          process.send(
-            events,
-            ResponseStatus(200, [#("content-type", "application/json")]),
-          )
-          let page =
-            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"ok\",\"inputSchema\":{\"type\":\"object\"}}]}}"
-          process.send(events, ResponseChunk(bit_array.from_string(page)))
-          process.send(events, ResponseEnd)
-        }
+        False, False, False ->
+          case string.contains(req.body, "\"id\":88") {
+            True -> {
+              assert list.contains(req.headers, #(
+                "mcp-session-id",
+                "sess-recovered",
+              ))
+              process.send(order, "response:88:sess-recovered")
+              process.send(events, ResponseStatus(202, []))
+              process.send(events, ResponseEnd)
+            }
+            False -> {
+              process.send(order, "tools/list:recovered")
+              process.send(
+                events,
+                ResponseStatus(200, [#("content-type", "text/event-stream")]),
+              )
+              let srv_req =
+                "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"roots/list\"}"
+              let page =
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"ok\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+              process.send(
+                events,
+                ResponseChunk(bit_array.from_string(sse.encode(srv_req))),
+              )
+              process.sleep(40)
+              process.send(
+                events,
+                ResponseChunk(bit_array.from_string(sse.encode(page))),
+              )
+              process.send(events, ResponseEnd)
+            }
+          }
       }
     })
   let config =
@@ -402,6 +424,7 @@ pub fn initialized_notification_gates_subsequent_requests_and_recovers_expired_s
       "initialize:sess-recovered",
       "notifications/initialized:recovered",
       "tools/list:recovered",
+      "response:88:sess-recovered",
     ]
   let assert Ok(Nil) = client.shutdown(started, 5000) as "shutdown gated client"
 }

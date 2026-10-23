@@ -228,6 +228,7 @@ type WireMode {
     protocol_version: Option(String),
     queued_lines: List(String),
   )
+  RecoveringSession(queued_lines: List(String))
   InitializedSession(
     session_id: Option(String),
     protocol_version: Option(String),
@@ -271,12 +272,12 @@ type Msg {
     outcome: Result(Nil, FaultKind),
     health: SessionHealth,
   )
+  RecoveryDone(key: Int, outcome: Result(WireMode, FaultKind))
   RequestDone(
     key: Int,
     reply: JsonValue,
     schemas: Dict(String, JsonValue),
     health: SessionHealth,
-    recovered_mode: Option(WireMode),
   )
   NotificationDone(key: Int, health: SessionHealth)
   Close
@@ -497,13 +498,21 @@ fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
           handle_initialized_done(state, outcome, health)
         }
       }
-    Running, RequestDone(key, reply, schemas, health, recovered_mode) ->
+    Running, RecoveryDone(key, outcome) ->
+      case dict.has_key(state.inflight, key) {
+        False -> sm.keep(state)
+        True -> {
+          let state = retire_key(state, key)
+          handle_recovery_done(state, outcome)
+        }
+      }
+    Running, RequestDone(key, reply, schemas, health) ->
       case dict.has_key(state.inflight, key) {
         False -> sm.keep(state)
         True -> {
           let state = retire_key(state, key)
           send_frame(state.inbound, reply)
-          let mode = next_mode_after_request(state.mode, health, recovered_mode)
+          let mode = next_mode_after_request(state.mode, health)
           sm.keep(
             State(
               ..state,
@@ -581,15 +590,31 @@ fn fail_queued_requests(
   })
 }
 
+fn handle_recovery_done(
+  state: State,
+  outcome: Result(WireMode, FaultKind),
+) -> sm.Next(Phase, State, Msg) {
+  case outcome, state.mode {
+    Ok(recovered), RecoveringSession(queued_lines:) -> {
+      let ready = State(..state, mode: recovered)
+      sm.keep(list.fold(queued_lines, ready, dispatch_line))
+    }
+    Ok(recovered), _ -> sm.keep(State(..state, mode: recovered))
+    Error(fault), RecoveringSession(queued_lines:) -> {
+      fail_queued_requests(state.inbound, queued_lines, fault)
+      sm.keep(State(..state, mode: Negotiating))
+    }
+    Error(_), _ -> sm.keep(State(..state, mode: Negotiating))
+  }
+}
+
 fn next_mode_after_request(
   current: WireMode,
   health: SessionHealth,
-  recovered_mode: Option(WireMode),
 ) -> WireMode {
-  case recovered_mode, health {
-    Some(recovered), SessionIntact -> recovered
-    _, SessionExpiredOnServer -> Negotiating
-    None, SessionIntact -> current
+  case health {
+    SessionExpiredOnServer -> Negotiating
+    SessionIntact -> current
   }
 }
 
@@ -602,14 +627,15 @@ fn apply_session_health(state: State, health: SessionHealth) -> State {
 
 fn handle_send(state: State, line: String) -> sm.Next(Phase, State, Msg) {
   let trimmed = string.trim_end(line)
-  case state.mode, jsonrpc.decode(trimmed) {
+  case state.mode, state.last_init_params, jsonrpc.decode(trimmed) {
     AwaitingInitialized(session_id:, protocol_version:, ..),
+      _,
       Ok(jsonrpc.Notification(method: "notifications/initialized", ..))
     -> {
       let active_mode = InitializedSession(session_id:, protocol_version:)
       sm.keep(spawn_initialized_notification(state, active_mode))
     }
-    AwaitingInitialized(session_id:, protocol_version:, queued_lines:), _ ->
+    AwaitingInitialized(session_id:, protocol_version:, queued_lines:), _, _ ->
       sm.keep(
         State(
           ..state,
@@ -620,8 +646,50 @@ fn handle_send(state: State, line: String) -> sm.Next(Phase, State, Msg) {
           ),
         ),
       )
-    _, _ -> sm.keep(dispatch_line(state, trimmed))
+    RecoveringSession(..),
+      _,
+      Ok(jsonrpc.ServerRequest(method: "initialize", ..))
+    -> sm.keep(dispatch_line(state, trimmed))
+    RecoveringSession(queued_lines:), _, _ ->
+      sm.keep(
+        State(
+          ..state,
+          mode: RecoveringSession(
+            queued_lines: list.append(queued_lines, [trimmed]),
+          ),
+        ),
+      )
+    Negotiating, Some(_), Ok(jsonrpc.ServerRequest(method: "initialize", ..)) ->
+      sm.keep(dispatch_line(state, trimmed))
+    Negotiating, Some(init_params), Ok(jsonrpc.ServerRequest(..)) -> {
+      let recovering =
+        State(..state, mode: RecoveringSession(queued_lines: [trimmed]))
+      sm.keep(spawn_session_recovery(recovering, init_params))
+    }
+    _, _, _ -> sm.keep(dispatch_line(state, trimmed))
   }
+}
+
+fn spawn_session_recovery(state: State, init_params: JsonValue) -> State {
+  let key = state.next_key
+  let config = state.config
+  let inbound = state.inbound
+  let commands = state.commands
+  let run =
+    spawn_bounded(
+      config.request_timeout_ms,
+      fn(ledger) {
+        recover_expired_session(ledger, config, inbound, init_params)
+      },
+      fn() { Error(UnavailableFault("timed out waiting for HTTP response")) },
+      fn(outcome) { RecoveryDone(key, outcome) },
+      commands,
+    )
+  State(
+    ..state,
+    next_key: key + 1,
+    inflight: dict.insert(state.inflight, key, run),
+  )
 }
 
 fn dispatch_line(state: State, trimmed: String) -> State {
@@ -651,7 +719,10 @@ fn dispatch_line(state: State, trimmed: String) -> State {
     Ok(jsonrpc.Notification(method: "notifications/initialized", ..)) ->
       case state.mode {
         StatelessModern -> state
-        Negotiating | AwaitingInitialized(..) | InitializedSession(..) ->
+        Negotiating
+        | AwaitingInitialized(..)
+        | RecoveringSession(..)
+        | InitializedSession(..) ->
           spawn_initialized_notification(state, state.mode)
       }
     Ok(jsonrpc.ServerRequest(id:, method:, params:)) -> {
@@ -659,7 +730,6 @@ fn dispatch_line(state: State, trimmed: String) -> State {
       let config = state.config
       let inbound = state.inbound
       let mode = state.mode
-      let last_init = state.last_init_params
       let schemas = state.tool_schemas
       let commands = state.commands
       let run =
@@ -671,7 +741,6 @@ fn dispatch_line(state: State, trimmed: String) -> State {
               config,
               inbound,
               mode,
-              last_init,
               schemas,
               id,
               method,
@@ -686,10 +755,9 @@ fn dispatch_line(state: State, trimmed: String) -> State {
               ),
               dict.new(),
               SessionIntact,
-              None,
             )
           },
-          fn(res) { RequestDone(key, res.0, res.1, res.2, res.3) },
+          fn(res) { RequestDone(key, res.0, res.1, res.2) },
           commands,
         )
       State(
@@ -1005,7 +1073,7 @@ fn run_initialized_notification(
       session_id,
       protocol_version,
     )
-    Negotiating | StatelessModern -> #(None, None)
+    Negotiating | RecoveringSession(..) | StatelessModern -> #(None, None)
   }
   case
     post_notification(
@@ -1042,7 +1110,7 @@ fn run_outbound_frame(
       [],
     )
     StatelessModern -> #(None, Some("2026-07-28"), [])
-    Negotiating -> #(None, None, [])
+    Negotiating | RecoveringSession(..) -> #(None, None, [])
   }
   case
     post_notification(
@@ -1057,54 +1125,6 @@ fn run_outbound_frame(
   {
     Ok(Nil) -> SessionIntact
     Error(fault) -> session_health_for_fault(session_id, fault)
-  }
-}
-
-fn run_request(
-  ledger: weft.Ledger,
-  config: Config,
-  inbound: Subject(transport.TransportEvent),
-  mode: WireMode,
-  last_init_params: Option(JsonValue),
-  schemas: Dict(String, JsonValue),
-  id: Id,
-  method: String,
-  params: Option(JsonValue),
-) -> #(JsonValue, Dict(String, JsonValue), SessionHealth, Option(WireMode)) {
-  case mode, last_init_params {
-    Negotiating, Some(init_params) ->
-      case recover_expired_session(ledger, config, inbound, init_params) {
-        Error(fault) -> #(
-          tagged_error_response(id, fault),
-          dict.new(),
-          SessionIntact,
-          None,
-        )
-        Ok(recovered) ->
-          execute_request_in_mode(
-            ledger,
-            config,
-            inbound,
-            recovered,
-            Some(recovered),
-            schemas,
-            id,
-            method,
-            params,
-          )
-      }
-    _, _ ->
-      execute_request_in_mode(
-        ledger,
-        config,
-        inbound,
-        mode,
-        None,
-        schemas,
-        id,
-        method,
-        params,
-      )
   }
 }
 
@@ -1128,17 +1148,16 @@ fn recover_expired_session(
   }
 }
 
-fn execute_request_in_mode(
+fn run_request(
   ledger: weft.Ledger,
   config: Config,
   inbound: Subject(transport.TransportEvent),
   mode: WireMode,
-  recovered_mode: Option(WireMode),
   schemas: Dict(String, JsonValue),
   id: Id,
   method: String,
   params: Option(JsonValue),
-) -> #(JsonValue, Dict(String, JsonValue), SessionHealth, Option(WireMode)) {
+) -> #(JsonValue, Dict(String, JsonValue), SessionHealth) {
   let #(session_id, protocol_version, extra_headers, envelope) = case mode {
     StatelessModern -> {
       let env =
@@ -1165,7 +1184,12 @@ fn execute_request_in_mode(
       [],
       jsonrpc.request(id, method, params),
     )
-    Negotiating -> #(None, None, [], jsonrpc.request(id, method, params))
+    Negotiating | RecoveringSession(..) -> #(
+      None,
+      None,
+      [],
+      jsonrpc.request(id, method, params),
+    )
   }
   case
     post_exchange(
@@ -1183,20 +1207,18 @@ fn execute_request_in_mode(
       tagged_error_response(id, fault),
       dict.new(),
       session_health_for_fault(session_id, fault),
-      None,
     )
     Ok(ParsedResponse(value:, outcome: Ok(result_obj), ..)) -> {
       let discovered = case method {
         "tools/list" -> extract_tool_schemas(result_obj)
         _ -> dict.new()
       }
-      #(value, discovered, SessionIntact, recovered_mode)
+      #(value, discovered, SessionIntact)
     }
     Ok(ParsedResponse(value:, outcome: Error(_), ..)) -> #(
       value,
       dict.new(),
       SessionIntact,
-      recovered_mode,
     )
   }
 }
@@ -1483,6 +1505,7 @@ fn delete_session_if_needed(config: Config, mode: WireMode) -> Nil {
     InitializedSession(session_id: None, ..)
     | AwaitingInitialized(session_id: None, ..)
     | Negotiating
+    | RecoveringSession(..)
     | StatelessModern -> Nil
   }
 }
