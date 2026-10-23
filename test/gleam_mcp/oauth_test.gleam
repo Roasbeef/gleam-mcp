@@ -176,3 +176,62 @@ pub fn exchange_refresh_and_bindings_codec_round_trip_test() {
   let encoded = oauth.encode_bindings([refreshed])
   assert oauth.decode_bindings(encoded) == Ok([refreshed])
 }
+
+pub fn discover_rejects_mismatched_issuer_and_loopback_downgrade_from_public_resource_test() {
+  let mismatched_issuer =
+    fake_services(fn(req) {
+      case req.url {
+        "https://mcp.example.com/.well-known/oauth-protected-resource" ->
+          Ok(HttpResponse(
+            status: 200,
+            headers: [],
+            body: "{\"authorization_servers\":[\"https://auth.example.com\"]}",
+          ))
+        "https://auth.example.com/.well-known/oauth-authorization-server" ->
+          Ok(HttpResponse(
+            status: 200,
+            headers: [],
+            body: "{\"issuer\":\"https://other-issuer.example.com\",\"authorization_endpoint\":\"https://auth.example.com/authorize\",\"token_endpoint\":\"https://auth.example.com/token\"}",
+          ))
+        _ -> Ok(HttpResponse(status: 404, headers: [], body: ""))
+      }
+    })
+  assert oauth.discover("https://mcp.example.com", mismatched_issuer)
+    == Error("invalid_auth_server_metadata")
+
+  let loopback_prm =
+    fake_services(fn(req) {
+      case req.url {
+        "https://mcp.example.com/.well-known/oauth-protected-resource" ->
+          Ok(HttpResponse(
+            status: 200,
+            headers: [],
+            body: "{\"authorization_servers\":[\"http://127.0.0.1:8080\"]}",
+          ))
+        _ -> Ok(HttpResponse(status: 404, headers: [], body: ""))
+      }
+    })
+  assert oauth.discover("https://mcp.example.com", loopback_prm)
+    == Error("invalid_protected_resource_metadata")
+
+  let loopback_token_ep =
+    fake_services(fn(req) {
+      case req.url {
+        "https://mcp.example.com/.well-known/oauth-protected-resource" ->
+          Ok(HttpResponse(
+            status: 200,
+            headers: [],
+            body: "{\"authorization_servers\":[\"https://auth.example.com\"]}",
+          ))
+        "https://auth.example.com/.well-known/oauth-authorization-server" ->
+          Ok(HttpResponse(
+            status: 200,
+            headers: [],
+            body: "{\"issuer\":\"https://auth.example.com\",\"authorization_endpoint\":\"https://auth.example.com/authorize\",\"token_endpoint\":\"http://127.0.0.1:8080/token\"}",
+          ))
+        _ -> Ok(HttpResponse(status: 404, headers: [], body: ""))
+      }
+    })
+  assert oauth.discover("https://mcp.example.com", loopback_token_ep)
+    == Error("invalid_auth_server_metadata")
+}

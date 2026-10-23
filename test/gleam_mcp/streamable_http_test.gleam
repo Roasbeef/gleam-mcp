@@ -21,19 +21,21 @@ fn scripted_transport(
     let ready = process.new_subject()
     let pid =
       process.spawn_unlinked(fn() {
-        let go = process.new_subject()
-        process.send(ready, go)
-        case process.receive(go, 5000) {
-          Ok(Nil) -> handler(req, events)
-          Error(Nil) -> Nil
+        let control = process.new_subject()
+        process.send(ready, control)
+        case process.receive(control, 5000) {
+          Ok(True) -> handler(req, events)
+          Ok(False) | Error(Nil) -> Nil
         }
       })
-    let assert Ok(go) = process.receive(ready, 1000)
+    let assert Ok(control) = process.receive(ready, 1000)
       as "worker must report subject"
     Ok(
       PreparedHttp(
-        running: RunningHttp(owner: pid, cancel: fn() { process.kill(pid) }),
-        begin: fn() { process.send(go, Nil) },
+        running: RunningHttp(owner: pid, cancel: fn() {
+          process.send(control, False)
+        }),
+        begin: fn() { process.send(control, True) },
       ),
     )
   })
@@ -303,6 +305,182 @@ pub fn oauth_unauthorized_retries_once_and_oversized_body_tags_malformed_fault_t
     as "tagged fault classifies as MalformedFault"
   assert string.contains(reason, "-byte limit")
   let assert Ok(Nil) = client.shutdown(started, 5000) as "shutdown after fault"
+}
+
+pub fn initialized_notification_gates_subsequent_requests_and_recovers_expired_session_on_404_test() {
+  let order = process.new_subject()
+  let http_transport =
+    scripted_transport(fn(req, events) {
+      case
+        string.contains(req.body, "\"initialize\""),
+        string.contains(req.body, "notifications/initialized"),
+        list.contains(req.headers, #("mcp-session-id", "sess-expired"))
+      {
+        True, _, _ -> {
+          let sid = case string.contains(req.body, "\"reinit\"") {
+            True -> "sess-recovered"
+            False -> "sess-expired"
+          }
+          process.send(order, "initialize:" <> sid)
+          process.send(
+            events,
+            ResponseStatus(200, [
+              #("content-type", "application/json"),
+              #("mcp-session-id", sid),
+            ]),
+          )
+          let reply =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}}}}"
+          let body = case string.contains(req.body, "\"reinit\"") {
+            True ->
+              "{\"jsonrpc\":\"2.0\",\"id\":\"reinit\",\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}}}}"
+            False -> reply
+          }
+          process.send(events, ResponseChunk(bit_array.from_string(body)))
+          process.send(events, ResponseEnd)
+        }
+        False, True, True -> {
+          process.sleep(60)
+          process.send(order, "notifications/initialized")
+          process.send(events, ResponseStatus(202, []))
+          process.send(events, ResponseEnd)
+        }
+        False, True, False -> {
+          process.send(order, "notifications/initialized:recovered")
+          process.send(events, ResponseStatus(202, []))
+          process.send(events, ResponseEnd)
+        }
+        False, False, True -> {
+          process.send(order, "tools/list:expired-404")
+          process.send(events, ResponseStatus(404, []))
+          process.send(events, ResponseEnd)
+        }
+        False, False, False -> {
+          process.send(order, "tools/list:recovered")
+          process.send(
+            events,
+            ResponseStatus(200, [#("content-type", "application/json")]),
+          )
+          let page =
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"ok\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+          process.send(events, ResponseChunk(bit_array.from_string(page)))
+          process.send(events, ResponseEnd)
+        }
+      }
+    })
+  let config =
+    Config(
+      server: "gated",
+      url: "https://mcp.example.com/mcp",
+      auth: NoAuth,
+      http_transport:,
+      client_name: "loom",
+      client_version: "0.3.2",
+      login_command: "loomd mcp login",
+      request_timeout_ms: 5000,
+    )
+  let assert Ok(started) =
+    client.start(
+      streamable_http.seam(config),
+      client.options("0.3.2") |> client.with_client_name("loom"),
+    )
+    as "start client while notifications/initialized is gated"
+  let first_list = client.list_tools(started, 5000)
+  assert case first_list {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  let assert Ok(tools) = client.list_tools(started, 5000)
+    as "second list_tools transparently reinitializes after session 404"
+  assert list.map(tools, fn(t) { t.name }) == ["ok"]
+  let events_order = drain(order, [])
+  assert events_order
+    == [
+      "initialize:sess-expired",
+      "notifications/initialized",
+      "tools/list:expired-404",
+      "initialize:sess-recovered",
+      "notifications/initialized:recovered",
+      "tools/list:recovered",
+    ]
+  let assert Ok(Nil) = client.shutdown(started, 5000) as "shutdown gated client"
+}
+
+pub fn sse_server_request_and_stalled_request_timeout_cleanup_test() {
+  let seen_bodies = process.new_subject()
+  let http_transport =
+    scripted_transport(fn(req, events) {
+      process.send(seen_bodies, req.body)
+      case
+        string.contains(req.body, "\"initialize\""),
+        string.contains(req.body, "notifications/initialized"),
+        string.contains(req.body, "\"tools/list\""),
+        string.contains(req.body, "\"tools/call\"")
+      {
+        True, _, _, _ -> {
+          process.send(
+            events,
+            ResponseStatus(200, [#("content-type", "application/json")]),
+          )
+          let reply =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}}}}"
+          process.send(events, ResponseChunk(bit_array.from_string(reply)))
+          process.send(events, ResponseEnd)
+        }
+        False, True, _, _ -> {
+          process.send(events, ResponseStatus(202, []))
+          process.send(events, ResponseEnd)
+        }
+        False, False, True, _ -> {
+          process.send(
+            events,
+            ResponseStatus(200, [#("content-type", "text/event-stream")]),
+          )
+          let srv_req =
+            "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"roots/list\"}"
+          let progress =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}"
+          let page =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"stall\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+          let stream =
+            sse.encode(srv_req) <> sse.encode(progress) <> sse.encode(page)
+          process.send(events, ResponseChunk(bit_array.from_string(stream)))
+          process.send(events, ResponseEnd)
+        }
+        False, False, False, True -> {
+          process.sleep(500)
+        }
+        False, False, False, False -> {
+          process.send(events, ResponseStatus(202, []))
+          process.send(events, ResponseEnd)
+        }
+      }
+    })
+  let config =
+    Config(
+      server: "sse_and_timeout",
+      url: "https://mcp.example.com/mcp",
+      auth: NoAuth,
+      http_transport:,
+      client_name: "loom",
+      client_version: "0.3.2",
+      login_command: "loomd mcp login",
+      request_timeout_ms: 80,
+    )
+  let assert Ok(started) =
+    client.start(
+      streamable_http.seam(config),
+      client.options("0.3.2") |> client.with_client_name("loom"),
+    )
+    as "start client"
+  let assert Ok(tools) = client.list_tools(started, 5000)
+    as "list_tools succeeds when SSE stream interleaves server request and progress notification"
+  assert list.map(tools, fn(t) { t.name }) == ["stall"]
+  let _ = client.call_tool(started, "stall", json.Object([]), 5000)
+  let assert Ok(Nil) = client.shutdown(started, 5000)
+    as "shutdown succeeds cleanly after timed-out request"
+  let bodies = drain(seen_bodies, [])
+  assert list.any(bodies, fn(b) { string.contains(b, "\"id\":77") })
 }
 
 fn drain(subject: Subject(a), acc: List(a)) -> List(a) {

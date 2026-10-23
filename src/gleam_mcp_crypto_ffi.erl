@@ -6,8 +6,8 @@
 %% Flow: sha256 and hmac_sha256 call crypto:hash/2 and crypto:mac/4;
 %% secure_compare uses crypto:hash_equals/2 when byte sizes agree;
 %% strong_random_bytes calls crypto:strong_rand_bytes/1; monotonic_time_ms
-%% and system_time_ms read OTP's millisecond clocks; fault_key derives a
-%% VM-scoped HMAC key from the node and OS process identifier.
+%% and system_time_ms read OTP's millisecond clocks; fault_key generates a
+%% cryptographically random 32-byte VM-lifetime secret in persistent_term.
 -module(gleam_mcp_crypto_ffi).
 
 -export([
@@ -46,6 +46,11 @@ system_time_ms() ->
     erlang:system_time(millisecond).
 
 fault_key() ->
-    NodeBin = atom_to_binary(node(), utf8),
-    PidBin = unicode:characters_to_binary(os:getpid()),
-    crypto:hash(sha256, <<"gleam-mcp-http-fault:", NodeBin/binary, ":", PidBin/binary>>).
+    case persistent_term:get({?MODULE, fault_key}, undefined) of
+        Key when is_binary(Key) ->
+            Key;
+        undefined ->
+            Generated = crypto:strong_rand_bytes(32),
+            persistent_term:put({?MODULE, fault_key}, Generated),
+            Generated
+    end.

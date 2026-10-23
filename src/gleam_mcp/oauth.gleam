@@ -180,7 +180,7 @@ type ProtectedResource {
 
 type AuthServer {
   AuthServer(
-    issuer: Option(String),
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option(String),
@@ -413,7 +413,7 @@ fn decode_protected_resource(
   use Nil <- result.try(validate_prm_resource(prm.resource, server_url, origin))
   case prm.authorization_servers {
     [first, ..] ->
-      case valid_oauth_url(first) {
+      case valid_discovered_oauth_url(first, server_url) {
         True -> Ok(#(strip_trailing_slash(first), prm.scopes_supported))
         False -> Error("invalid_protected_resource_metadata")
       }
@@ -544,9 +544,13 @@ fn decode_auth_server(
   use Nil <- result.try(check_pkce_methods(
     parsed.code_challenge_methods_supported,
   ))
-  let issuer =
-    option.unwrap(parsed.issuer, auth_server_url) |> strip_trailing_slash
-  use Nil <- result.try(check_auth_server_urls(issuer, parsed))
+  let expected_issuer = strip_trailing_slash(auth_server_url)
+  let issuer = strip_trailing_slash(parsed.issuer)
+  use <- bool.guard(
+    when: issuer != expected_issuer,
+    return: Error("invalid_auth_server_metadata"),
+  )
+  use Nil <- result.try(check_auth_server_urls(server_url, issuer, parsed))
   let base_scopes = case prm_scopes {
     [] -> parsed.scopes_supported
     _ -> prm_scopes
@@ -580,17 +584,18 @@ fn check_pkce_methods(methods: Option(List(String))) -> Result(Nil, String) {
 }
 
 fn check_auth_server_urls(
+  server_url: String,
   issuer: String,
   parsed: AuthServer,
 ) -> Result(Nil, String) {
   let valid_reg = case parsed.registration_endpoint {
     None -> True
-    Some(reg) -> valid_oauth_url(reg)
+    Some(reg) -> valid_discovered_oauth_url(reg, server_url)
   }
   case
-    valid_oauth_url(issuer)
-    && valid_oauth_url(parsed.authorization_endpoint)
-    && valid_oauth_url(parsed.token_endpoint)
+    valid_discovered_oauth_url(issuer, server_url)
+    && valid_discovered_oauth_url(parsed.authorization_endpoint, server_url)
+    && valid_discovered_oauth_url(parsed.token_endpoint, server_url)
     && valid_reg
   {
     True -> Ok(Nil)
@@ -598,10 +603,34 @@ fn check_auth_server_urls(
   }
 }
 
+fn valid_discovered_oauth_url(raw: String, resource_url: String) -> Bool {
+  case valid_oauth_url(raw) {
+    False -> False
+    True ->
+      case is_loopback_url(resource_url), is_loopback_url(raw) {
+        True, _ -> True
+        False, False -> string.starts_with(raw, "https://")
+        False, True -> False
+      }
+  }
+}
+
+fn is_loopback_url(raw: String) -> Bool {
+  case uri.parse(raw) {
+    Ok(parsed) ->
+      case parsed.host {
+        Some(host) ->
+          loopback_host(host) || string.lowercase(host) == "localhost"
+        None -> False
+      }
+    Error(_) -> False
+  }
+}
+
 fn decode_auth_server_value(value: JsonValue) -> Result(AuthServer, String) {
   let fault = "invalid_auth_server_metadata"
   use fields <- result.try(object_fields(value, fault))
-  use issuer <- result.try(optional_string(fields, "issuer", fault))
+  use issuer <- result.try(required_string(fields, "issuer", fault))
   use authorization_endpoint <- result.try(required_string(
     fields,
     "authorization_endpoint",

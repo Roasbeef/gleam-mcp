@@ -223,11 +223,21 @@ pub type FaultKind {
 
 type WireMode {
   Negotiating
+  AwaitingInitialized(
+    session_id: Option(String),
+    protocol_version: Option(String),
+    queued_lines: List(String),
+  )
   InitializedSession(
     session_id: Option(String),
     protocol_version: Option(String),
   )
   StatelessModern
+}
+
+type SessionHealth {
+  SessionIntact
+  SessionExpiredOnServer
 }
 
 type Phase {
@@ -240,6 +250,7 @@ type State {
     inbound: Subject(transport.TransportEvent),
     commands: Subject(Msg),
     mode: WireMode,
+    last_init_params: Option(JsonValue),
     tool_schemas: Dict(String, JsonValue),
     next_key: Int,
     inflight: Dict(Int, weft.Detached(Nil, Nil)),
@@ -255,8 +266,19 @@ type Msg {
       #(Id, FaultKind),
     ),
   )
-  RequestDone(key: Int, reply: JsonValue, schemas: Dict(String, JsonValue))
-  NotificationDone(key: Int)
+  InitializedDone(
+    key: Int,
+    outcome: Result(Nil, FaultKind),
+    health: SessionHealth,
+  )
+  RequestDone(
+    key: Int,
+    reply: JsonValue,
+    schemas: Dict(String, JsonValue),
+    health: SessionHealth,
+    recovered_mode: Option(WireMode),
+  )
+  NotificationDone(key: Int, health: SessionHealth)
   Close
   ClientGone
 }
@@ -407,6 +429,7 @@ fn open_connection(
           inbound:,
           commands:,
           mode: Negotiating,
+          last_init_params: None,
           tool_schemas: dict.new(),
           next_key: 1,
           inflight: dict.new(),
@@ -443,11 +466,44 @@ fn open_connection(
 fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
   case phase, msg {
     Running, Send(line) -> handle_send(state, line)
-    Running, InitializeDone(key, outcome) -> {
-      let state = retire_key(state, key)
-      case outcome {
-        Ok(#(mode, reply, schemas)) -> {
+    Running, InitializeDone(key, outcome) ->
+      case dict.has_key(state.inflight, key) {
+        False -> sm.keep(state)
+        True -> {
+          let state = retire_key(state, key)
+          case outcome {
+            Ok(#(mode, reply, schemas)) -> {
+              send_frame(state.inbound, reply)
+              sm.keep(
+                State(
+                  ..state,
+                  mode:,
+                  tool_schemas: dict.merge(state.tool_schemas, schemas),
+                ),
+              )
+            }
+            Error(#(id, fault)) -> {
+              send_frame(state.inbound, tagged_error_response(id, fault))
+              sm.keep(state)
+            }
+          }
+        }
+      }
+    Running, InitializedDone(key, outcome, health) ->
+      case dict.has_key(state.inflight, key) {
+        False -> sm.keep(state)
+        True -> {
+          let state = retire_key(state, key)
+          handle_initialized_done(state, outcome, health)
+        }
+      }
+    Running, RequestDone(key, reply, schemas, health, recovered_mode) ->
+      case dict.has_key(state.inflight, key) {
+        False -> sm.keep(state)
+        True -> {
+          let state = retire_key(state, key)
           send_frame(state.inbound, reply)
+          let mode = next_mode_after_request(state.mode, health, recovered_mode)
           sm.keep(
             State(
               ..state,
@@ -456,20 +512,15 @@ fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
             ),
           )
         }
-        Error(#(id, fault)) -> {
-          send_frame(state.inbound, tagged_error_response(id, fault))
-          sm.keep(state)
+      }
+    Running, NotificationDone(key, health) ->
+      case dict.has_key(state.inflight, key) {
+        False -> sm.keep(state)
+        True -> {
+          let state = retire_key(state, key)
+          sm.keep(apply_session_health(state, health))
         }
       }
-    }
-    Running, RequestDone(key, reply, schemas) -> {
-      let state = retire_key(state, key)
-      send_frame(state.inbound, reply)
-      sm.keep(
-        State(..state, tool_schemas: dict.merge(state.tool_schemas, schemas)),
-      )
-    }
-    Running, NotificationDone(key) -> sm.keep(retire_key(state, key))
     Running, Close -> {
       let drained = cancel_all(state.inflight)
       delete_session_if_needed(state.config, state.mode)
@@ -491,86 +542,243 @@ fn handle(phase: Phase, state: State, msg: Msg) -> sm.Next(Phase, State, Msg) {
   }
 }
 
+fn handle_initialized_done(
+  state: State,
+  outcome: Result(Nil, FaultKind),
+  health: SessionHealth,
+) -> sm.Next(Phase, State, Msg) {
+  case outcome, state.mode {
+    Ok(Nil), AwaitingInitialized(session_id:, protocol_version:, queued_lines:)
+    -> {
+      let ready =
+        State(..state, mode: InitializedSession(session_id:, protocol_version:))
+      sm.keep(list.fold(queued_lines, ready, dispatch_line))
+    }
+    Ok(Nil), _ -> sm.keep(apply_session_health(state, health))
+    Error(fault), AwaitingInitialized(queued_lines:, ..) -> {
+      fail_queued_requests(state.inbound, queued_lines, fault)
+      process.send(state.inbound, transport.TransportClosed(tag_fault(fault)))
+      sm.keep(State(..state, mode: Negotiating))
+    }
+    Error(fault), _ -> {
+      process.send(state.inbound, transport.TransportClosed(tag_fault(fault)))
+      sm.keep(apply_session_health(state, health))
+    }
+  }
+}
+
+fn fail_queued_requests(
+  inbound: Subject(transport.TransportEvent),
+  queued_lines: List(String),
+  fault: FaultKind,
+) -> Nil {
+  list.each(queued_lines, fn(line) {
+    case jsonrpc.decode(string.trim_end(line)) {
+      Ok(jsonrpc.ServerRequest(id:, ..)) ->
+        send_frame(inbound, tagged_error_response(id, fault))
+      _ -> Nil
+    }
+  })
+}
+
+fn next_mode_after_request(
+  current: WireMode,
+  health: SessionHealth,
+  recovered_mode: Option(WireMode),
+) -> WireMode {
+  case recovered_mode, health {
+    Some(recovered), SessionIntact -> recovered
+    _, SessionExpiredOnServer -> Negotiating
+    None, SessionIntact -> current
+  }
+}
+
+fn apply_session_health(state: State, health: SessionHealth) -> State {
+  case health {
+    SessionIntact -> state
+    SessionExpiredOnServer -> State(..state, mode: Negotiating)
+  }
+}
+
 fn handle_send(state: State, line: String) -> sm.Next(Phase, State, Msg) {
   let trimmed = string.trim_end(line)
+  case state.mode, jsonrpc.decode(trimmed) {
+    AwaitingInitialized(session_id:, protocol_version:, ..),
+      Ok(jsonrpc.Notification(method: "notifications/initialized", ..))
+    -> {
+      let active_mode = InitializedSession(session_id:, protocol_version:)
+      sm.keep(spawn_initialized_notification(state, active_mode))
+    }
+    AwaitingInitialized(session_id:, protocol_version:, queued_lines:), _ ->
+      sm.keep(
+        State(
+          ..state,
+          mode: AwaitingInitialized(
+            session_id:,
+            protocol_version:,
+            queued_lines: list.append(queued_lines, [trimmed]),
+          ),
+        ),
+      )
+    _, _ -> sm.keep(dispatch_line(state, trimmed))
+  }
+}
+
+fn dispatch_line(state: State, trimmed: String) -> State {
   case jsonrpc.decode(trimmed) {
     Ok(jsonrpc.ServerRequest(id:, method: "initialize", params:)) -> {
       let key = state.next_key
       let config = state.config
+      let inbound = state.inbound
       let commands = state.commands
       let run =
-        weft.new_prepared([
-          weft.managed(fn(ledger) {
-            let outcome = run_initialize(ledger, config, id, params)
-            process.send(commands, InitializeDone(key, outcome))
-            Ok(Nil)
-          }),
-        ])
-        |> weft.deadline(config.request_timeout_ms)
-        |> weft.start_detached
-      sm.keep(
-        State(
-          ..state,
-          next_key: key + 1,
-          inflight: dict.insert(state.inflight, key, run),
-        ),
+        spawn_bounded(
+          config.request_timeout_ms,
+          fn(ledger) { run_initialize(ledger, config, inbound, id, params) },
+          fn() {
+            Error(#(id, UnavailableFault("timed out waiting for HTTP response")))
+          },
+          fn(outcome) { InitializeDone(key, outcome) },
+          commands,
+        )
+      State(
+        ..state,
+        last_init_params: Some(option.unwrap(params, json.Object([]))),
+        next_key: key + 1,
+        inflight: dict.insert(state.inflight, key, run),
       )
     }
     Ok(jsonrpc.Notification(method: "notifications/initialized", ..)) ->
       case state.mode {
-        StatelessModern -> sm.keep(state)
-        Negotiating | InitializedSession(..) -> {
-          let key = state.next_key
-          let config = state.config
-          let mode = state.mode
-          let commands = state.commands
-          let run =
-            weft.new_prepared([
-              weft.managed(fn(ledger) {
-                let _ = run_initialized_notification(ledger, config, mode)
-                process.send(commands, NotificationDone(key))
-                Ok(Nil)
-              }),
-            ])
-            |> weft.deadline(config.request_timeout_ms)
-            |> weft.start_detached
-          sm.keep(
-            State(
-              ..state,
-              next_key: key + 1,
-              inflight: dict.insert(state.inflight, key, run),
-            ),
-          )
-        }
+        StatelessModern -> state
+        Negotiating | AwaitingInitialized(..) | InitializedSession(..) ->
+          spawn_initialized_notification(state, state.mode)
       }
     Ok(jsonrpc.ServerRequest(id:, method:, params:)) -> {
       let key = state.next_key
       let config = state.config
+      let inbound = state.inbound
       let mode = state.mode
+      let last_init = state.last_init_params
       let schemas = state.tool_schemas
       let commands = state.commands
       let run =
-        weft.new_prepared([
-          weft.managed(fn(ledger) {
-            let #(reply, discovered) =
-              run_request(ledger, config, mode, schemas, id, method, params)
-            process.send(commands, RequestDone(key, reply, discovered))
-            Ok(Nil)
-          }),
-        ])
-        |> weft.deadline(config.request_timeout_ms)
-        |> weft.start_detached
-      sm.keep(
-        State(
-          ..state,
-          next_key: key + 1,
-          inflight: dict.insert(state.inflight, key, run),
-        ),
+        spawn_bounded(
+          config.request_timeout_ms,
+          fn(ledger) {
+            run_request(
+              ledger,
+              config,
+              inbound,
+              mode,
+              last_init,
+              schemas,
+              id,
+              method,
+              params,
+            )
+          },
+          fn() {
+            #(
+              tagged_error_response(
+                id,
+                UnavailableFault("timed out waiting for HTTP response"),
+              ),
+              dict.new(),
+              SessionIntact,
+              None,
+            )
+          },
+          fn(res) { RequestDone(key, res.0, res.1, res.2, res.3) },
+          commands,
+        )
+      State(
+        ..state,
+        next_key: key + 1,
+        inflight: dict.insert(state.inflight, key, run),
       )
     }
-    Ok(jsonrpc.Notification(..)) | Ok(jsonrpc.Response(..)) | Error(_) ->
-      sm.keep(state)
+    Ok(jsonrpc.Notification(method:, params:)) -> {
+      let envelope = jsonrpc.notification(method, params)
+      spawn_outbound_frame(state, envelope)
+    }
+    Ok(jsonrpc.Response(id:, outcome:)) -> {
+      let envelope = case outcome {
+        Ok(result) -> jsonrpc.response(id, result)
+        Error(err) -> jsonrpc.error_response(Some(id), err)
+      }
+      spawn_outbound_frame(state, envelope)
+    }
+    Error(_) -> state
   }
+}
+
+fn spawn_initialized_notification(state: State, mode: WireMode) -> State {
+  let key = state.next_key
+  let config = state.config
+  let inbound = state.inbound
+  let commands = state.commands
+  let run =
+    spawn_bounded(
+      config.request_timeout_ms,
+      fn(ledger) { run_initialized_notification(ledger, config, inbound, mode) },
+      fn() {
+        #(
+          Error(UnavailableFault("timed out waiting for HTTP response")),
+          SessionIntact,
+        )
+      },
+      fn(res) { InitializedDone(key, res.0, res.1) },
+      commands,
+    )
+  State(
+    ..state,
+    next_key: key + 1,
+    inflight: dict.insert(state.inflight, key, run),
+  )
+}
+
+fn spawn_outbound_frame(state: State, envelope: JsonValue) -> State {
+  let key = state.next_key
+  let config = state.config
+  let inbound = state.inbound
+  let mode = state.mode
+  let commands = state.commands
+  let run =
+    spawn_bounded(
+      config.request_timeout_ms,
+      fn(ledger) { run_outbound_frame(ledger, config, inbound, mode, envelope) },
+      fn() { SessionIntact },
+      fn(health) { NotificationDone(key, health) },
+      commands,
+    )
+  State(
+    ..state,
+    next_key: key + 1,
+    inflight: dict.insert(state.inflight, key, run),
+  )
+}
+
+fn spawn_bounded(
+  timeout_ms: Int,
+  work: fn(weft.Ledger) -> a,
+  on_timeout: fn() -> a,
+  to_msg: fn(a) -> Msg,
+  commands: Subject(Msg),
+) -> weft.Detached(Nil, Nil) {
+  let bounded_ms = int.max(timeout_ms, 1)
+  let timer =
+    process.send_after(commands, bounded_ms + 300, to_msg(on_timeout()))
+  weft.new_prepared([
+    weft.managed(fn(ledger) {
+      let outcome = work(ledger)
+      let _ = process.cancel_timer(timer)
+      process.send(commands, to_msg(outcome))
+      Ok(Nil)
+    }),
+  ])
+  |> weft.deadline(bounded_ms + 200)
+  |> weft.start_detached
 }
 
 fn retire_key(state: State, key: Int) -> State {
@@ -629,16 +837,32 @@ fn tagged_error_response(id: Id, fault: FaultKind) -> JsonValue {
 fn run_initialize(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Subject(transport.TransportEvent),
   id: Id,
   params: Option(JsonValue),
 ) -> Result(#(WireMode, JsonValue, Dict(String, JsonValue)), #(Id, FaultKind)) {
   let envelope = jsonrpc.request(id, "initialize", params)
-  case post_exchange(ledger, config, None, None, [], Some(id), envelope) {
+  case
+    post_exchange(
+      ledger,
+      config,
+      Some(inbound),
+      None,
+      None,
+      [],
+      Some(id),
+      envelope,
+    )
+  {
     Error(fault) -> Error(#(id, fault))
     Ok(ParsedResponse(session_id:, value:, outcome: Ok(result_obj))) -> {
       let negotiated = extract_protocol_version(result_obj)
       Ok(#(
-        InitializedSession(session_id:, protocol_version: negotiated),
+        AwaitingInitialized(
+          session_id:,
+          protocol_version: negotiated,
+          queued_lines: [],
+        ),
         value,
         dict.new(),
       ))
@@ -649,7 +873,7 @@ fn run_initialize(
       ..,
     ))
       if code == -32_020 || code == -32_022 || code == -32_600 || code == -32_601
-    -> probe_stateless_modern(ledger, config, id, original_error)
+    -> probe_stateless_modern(ledger, config, inbound, id, original_error)
     Ok(ParsedResponse(session_id:, value:, outcome: Error(_))) ->
       Ok(#(
         InitializedSession(session_id:, protocol_version: None),
@@ -665,6 +889,7 @@ fn run_initialize(
 fn probe_stateless_modern(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Subject(transport.TransportEvent),
   init_id: Id,
   original_error: JsonValue,
 ) -> Result(#(WireMode, JsonValue, Dict(String, JsonValue)), #(Id, FaultKind)) {
@@ -682,6 +907,7 @@ fn probe_stateless_modern(
     post_exchange(
       ledger,
       config,
+      Some(inbound),
       None,
       None,
       discover_headers,
@@ -694,16 +920,23 @@ fn probe_stateless_modern(
         Ok(info) ->
           Ok(synthesized_modern_init(init_id, info.instructions, dict.new()))
         Error(_) ->
-          probe_modern_tools_list(ledger, config, init_id, original_error)
+          probe_modern_tools_list(
+            ledger,
+            config,
+            inbound,
+            init_id,
+            original_error,
+          )
       }
     Ok(_) | Error(_) ->
-      probe_modern_tools_list(ledger, config, init_id, original_error)
+      probe_modern_tools_list(ledger, config, inbound, init_id, original_error)
   }
 }
 
 fn probe_modern_tools_list(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Subject(transport.TransportEvent),
   init_id: Id,
   original_error: JsonValue,
 ) -> Result(#(WireMode, JsonValue, Dict(String, JsonValue)), #(Id, FaultKind)) {
@@ -720,6 +953,7 @@ fn probe_modern_tools_list(
     post_exchange(
       ledger,
       config,
+      Some(inbound),
       None,
       None,
       extra_headers,
@@ -759,33 +993,152 @@ fn synthesized_modern_init(
 fn run_initialized_notification(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Subject(transport.TransportEvent),
   mode: WireMode,
-) -> Result(Nil, FaultKind) {
+) -> #(Result(Nil, FaultKind), SessionHealth) {
   let #(session_id, protocol_version) = case mode {
     InitializedSession(session_id:, protocol_version:) -> #(
       session_id,
       protocol_version,
     )
+    AwaitingInitialized(session_id:, protocol_version:, ..) -> #(
+      session_id,
+      protocol_version,
+    )
     Negotiating | StatelessModern -> #(None, None)
   }
-  post_notification(
-    ledger,
-    config,
-    session_id,
-    protocol_version,
-    protocol.initialized(),
-  )
+  case
+    post_notification(
+      ledger,
+      config,
+      Some(inbound),
+      session_id,
+      protocol_version,
+      [],
+      protocol.initialized(),
+    )
+  {
+    Ok(Nil) -> #(Ok(Nil), SessionIntact)
+    Error(fault) -> #(Error(fault), session_health_for_fault(session_id, fault))
+  }
+}
+
+fn run_outbound_frame(
+  ledger: weft.Ledger,
+  config: Config,
+  inbound: Subject(transport.TransportEvent),
+  mode: WireMode,
+  envelope: JsonValue,
+) -> SessionHealth {
+  let #(session_id, protocol_version, extra_headers) = case mode {
+    InitializedSession(session_id:, protocol_version:) -> #(
+      session_id,
+      protocol_version,
+      [],
+    )
+    AwaitingInitialized(session_id:, protocol_version:, ..) -> #(
+      session_id,
+      protocol_version,
+      [],
+    )
+    StatelessModern -> #(None, Some("2026-07-28"), [])
+    Negotiating -> #(None, None, [])
+  }
+  case
+    post_notification(
+      ledger,
+      config,
+      Some(inbound),
+      session_id,
+      protocol_version,
+      extra_headers,
+      envelope,
+    )
+  {
+    Ok(Nil) -> SessionIntact
+    Error(fault) -> session_health_for_fault(session_id, fault)
+  }
 }
 
 fn run_request(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Subject(transport.TransportEvent),
   mode: WireMode,
+  last_init_params: Option(JsonValue),
   schemas: Dict(String, JsonValue),
   id: Id,
   method: String,
   params: Option(JsonValue),
-) -> #(JsonValue, Dict(String, JsonValue)) {
+) -> #(JsonValue, Dict(String, JsonValue), SessionHealth, Option(WireMode)) {
+  case mode, last_init_params {
+    Negotiating, Some(init_params) ->
+      case recover_expired_session(ledger, config, inbound, init_params) {
+        Error(fault) -> #(
+          tagged_error_response(id, fault),
+          dict.new(),
+          SessionIntact,
+          None,
+        )
+        Ok(recovered) ->
+          execute_request_in_mode(
+            ledger,
+            config,
+            inbound,
+            recovered,
+            Some(recovered),
+            schemas,
+            id,
+            method,
+            params,
+          )
+      }
+    _, _ ->
+      execute_request_in_mode(
+        ledger,
+        config,
+        inbound,
+        mode,
+        None,
+        schemas,
+        id,
+        method,
+        params,
+      )
+  }
+}
+
+fn recover_expired_session(
+  ledger: weft.Ledger,
+  config: Config,
+  inbound: Subject(transport.TransportEvent),
+  init_params: JsonValue,
+) -> Result(WireMode, FaultKind) {
+  let init_id = jsonrpc.IdString("reinit")
+  case run_initialize(ledger, config, inbound, init_id, Some(init_params)) {
+    Error(#(_, fault)) -> Error(fault)
+    Ok(#(AwaitingInitialized(session_id:, protocol_version:, ..), _, _)) -> {
+      let recovered = InitializedSession(session_id:, protocol_version:)
+      case run_initialized_notification(ledger, config, inbound, recovered) {
+        #(Ok(Nil), _) -> Ok(recovered)
+        #(Error(fault), _) -> Error(fault)
+      }
+    }
+    Ok(#(other_mode, _, _)) -> Ok(other_mode)
+  }
+}
+
+fn execute_request_in_mode(
+  ledger: weft.Ledger,
+  config: Config,
+  inbound: Subject(transport.TransportEvent),
+  mode: WireMode,
+  recovered_mode: Option(WireMode),
+  schemas: Dict(String, JsonValue),
+  id: Id,
+  method: String,
+  params: Option(JsonValue),
+) -> #(JsonValue, Dict(String, JsonValue), SessionHealth, Option(WireMode)) {
   let #(session_id, protocol_version, extra_headers, envelope) = case mode {
     StatelessModern -> {
       let env =
@@ -806,12 +1159,19 @@ fn run_request(
       [],
       jsonrpc.request(id, method, params),
     )
+    AwaitingInitialized(session_id:, protocol_version:, ..) -> #(
+      session_id,
+      protocol_version,
+      [],
+      jsonrpc.request(id, method, params),
+    )
     Negotiating -> #(None, None, [], jsonrpc.request(id, method, params))
   }
   case
     post_exchange(
       ledger,
       config,
+      Some(inbound),
       session_id,
       protocol_version,
       extra_headers,
@@ -819,15 +1179,36 @@ fn run_request(
       envelope,
     )
   {
-    Error(fault) -> #(tagged_error_response(id, fault), dict.new())
+    Error(fault) -> #(
+      tagged_error_response(id, fault),
+      dict.new(),
+      session_health_for_fault(session_id, fault),
+      None,
+    )
     Ok(ParsedResponse(value:, outcome: Ok(result_obj), ..)) -> {
       let discovered = case method {
         "tools/list" -> extract_tool_schemas(result_obj)
         _ -> dict.new()
       }
-      #(value, discovered)
+      #(value, discovered, SessionIntact, recovered_mode)
     }
-    Ok(ParsedResponse(value:, outcome: Error(_), ..)) -> #(value, dict.new())
+    Ok(ParsedResponse(value:, outcome: Error(_), ..)) -> #(
+      value,
+      dict.new(),
+      SessionIntact,
+      recovered_mode,
+    )
+  }
+}
+
+fn session_health_for_fault(
+  session_id: Option(String),
+  fault: FaultKind,
+) -> SessionHealth {
+  case session_id, fault {
+    Some(_), UnavailableFault("the server answered HTTP 404") ->
+      SessionExpiredOnServer
+    _, _ -> SessionIntact
   }
 }
 
@@ -896,6 +1277,7 @@ fn extract_tool_schemas(value: JsonValue) -> Dict(String, JsonValue) {
 fn post_exchange(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Option(Subject(transport.TransportEvent)),
   session_id: Option(String),
   protocol_version: Option(String),
   extra_headers: List(#(String, String)),
@@ -918,6 +1300,7 @@ fn post_exchange(
     execute_http(
       ledger,
       config.http_transport,
+      inbound,
       "POST",
       config.url,
       headers,
@@ -933,6 +1316,7 @@ fn post_exchange(
       retry_after_unauthorized(
         ledger,
         config,
+        inbound,
         PostAttempt(
           session_id:,
           protocol_version:,
@@ -967,6 +1351,7 @@ fn empty_accepted(
 fn retry_after_unauthorized(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Option(Subject(transport.TransportEvent)),
   attempt: PostAttempt,
   used_oauth_token: Option(String),
   status: Int,
@@ -988,6 +1373,7 @@ fn retry_after_unauthorized(
         execute_http(
           ledger,
           config.http_transport,
+          inbound,
           "POST",
           config.url,
           headers,
@@ -1031,16 +1417,19 @@ fn finish_retry_outcome(
 fn post_notification(
   ledger: weft.Ledger,
   config: Config,
+  inbound: Option(Subject(transport.TransportEvent)),
   session_id: Option(String),
   protocol_version: Option(String),
+  extra_headers: List(#(String, String)),
   envelope: JsonValue,
 ) -> Result(Nil, FaultKind) {
   use _ <- result.try(post_exchange(
     ledger,
     config,
+    inbound,
     session_id,
     protocol_version,
-    [],
+    extra_headers,
     None,
     envelope,
   ))
@@ -1070,8 +1459,31 @@ fn delete_session_if_needed(config: Config, mode: WireMode) -> Nil {
         |> weft.start
       Nil
     }
-    InitializedSession(session_id: None, ..) | Negotiating | StatelessModern ->
+    AwaitingInitialized(session_id: Some(sid), protocol_version:, ..) -> {
+      let auth = config.auth
+      let transport = config.http_transport
+      let url = config.url
+      let _ =
+        weft.new_prepared([
+          weft.managed(fn(ledger) {
+            send_session_delete(
+              ledger,
+              auth,
+              transport,
+              url,
+              sid,
+              protocol_version,
+            )
+          }),
+        ])
+        |> weft.deadline(1000)
+        |> weft.start
       Nil
+    }
+    InitializedSession(session_id: None, ..)
+    | AwaitingInitialized(session_id: None, ..)
+    | Negotiating
+    | StatelessModern -> Nil
   }
 }
 
@@ -1089,7 +1501,17 @@ fn send_session_delete(
       let headers =
         build_request_headers(Some(sid), protocol_version, [], auth_headers)
       let _ =
-        execute_http(ledger, transport, "DELETE", url, headers, "", None, 1000)
+        execute_http(
+          ledger,
+          transport,
+          None,
+          "DELETE",
+          url,
+          headers,
+          "",
+          None,
+          1000,
+        )
       Ok(Nil)
     }
   }
@@ -1145,6 +1567,7 @@ fn build_request_headers(
 fn execute_http(
   ledger: weft.Ledger,
   http_transport: HttpTransport,
+  inbound: Option(Subject(transport.TransportEvent)),
   method: String,
   url: String,
   headers: List(#(String, String)),
@@ -1169,7 +1592,7 @@ fn execute_http(
         weft.Adopted -> {
           prepared.begin()
           let deadline = ffi_crypto.monotonic_time_ms() + int.max(timeout_ms, 1)
-          let outcome = await_status(events, expected_id, deadline)
+          let outcome = await_status(events, inbound, expected_id, deadline)
           prepared.running.cancel()
           outcome
         }
@@ -1179,6 +1602,7 @@ fn execute_http(
 
 fn await_status(
   events: Subject(HttpEvent),
+  inbound: Option(Subject(transport.TransportEvent)),
   expected_id: Option(Id),
   deadline: Int,
 ) -> RawHttpOutcome {
@@ -1194,12 +1618,20 @@ fn await_status(
     Ok(ResponseChunk(_)) | Ok(ResponseEnd) ->
       RawFault(MalformedFault("HTTP response body preceded headers"))
     Ok(ResponseStatus(status:, headers:)) ->
-      dispatch_response_status(events, status, headers, expected_id, deadline)
+      dispatch_response_status(
+        events,
+        inbound,
+        status,
+        headers,
+        expected_id,
+        deadline,
+      )
   }
 }
 
 fn dispatch_response_status(
   events: Subject(HttpEvent),
+  inbound: Option(Subject(transport.TransportEvent)),
   status: Int,
   headers: List(#(String, String)),
   expected_id: Option(Id),
@@ -1210,9 +1642,11 @@ fn dispatch_response_status(
   let content_type = media_type(headers)
   case status, content_type, expected_id {
     401, _, _ | 403, _, _ -> RawUnauthorized(status)
+    404, _, _ -> RawFault(UnavailableFault("the server answered HTTP 404"))
     s, "text/event-stream", Some(id) if s >= 200 && s < 300 ->
       case sse.new(max_response_bytes) {
-        Ok(decoder) -> collect_sse(events, session_id, id, decoder, deadline)
+        Ok(decoder) ->
+          collect_sse(events, inbound, session_id, id, decoder, deadline)
         Error(reason) -> RawFault(MalformedFault(reason))
       }
     _, _, _ ->
@@ -1230,6 +1664,7 @@ fn dispatch_response_status(
 
 fn collect_sse(
   events: Subject(HttpEvent),
+  inbound: Option(Subject(transport.TransportEvent)),
   session_id: Option(String),
   expected_id: Id,
   decoder: sse.Decoder,
@@ -1248,7 +1683,15 @@ fn collect_sse(
       RawFault(MalformedFault("duplicate HTTP status in SSE stream"))
     Ok(ResponseEnd) -> finish_sse_stream(decoder)
     Ok(ResponseChunk(chunk:)) ->
-      feed_sse_chunk(events, session_id, expected_id, decoder, chunk, deadline)
+      feed_sse_chunk(
+        events,
+        inbound,
+        session_id,
+        expected_id,
+        decoder,
+        chunk,
+        deadline,
+      )
   }
 }
 
@@ -1267,6 +1710,7 @@ fn finish_sse_stream(decoder: sse.Decoder) -> RawHttpOutcome {
 
 fn feed_sse_chunk(
   events: Subject(HttpEvent),
+  inbound: Option(Subject(transport.TransportEvent)),
   session_id: Option(String),
   expected_id: Id,
   decoder: sse.Decoder,
@@ -1282,10 +1726,17 @@ fn feed_sse_chunk(
         <> reason,
       ))
     Ok(#(next_decoder, sse_events)) ->
-      case inspect_sse_events(sse_events, session_id, expected_id) {
+      case inspect_sse_events(sse_events, inbound, session_id, expected_id) {
         Ok(Some(parsed)) -> RawParsed(parsed)
         Ok(None) ->
-          collect_sse(events, session_id, expected_id, next_decoder, deadline)
+          collect_sse(
+            events,
+            inbound,
+            session_id,
+            expected_id,
+            next_decoder,
+            deadline,
+          )
         Error(fault) -> RawFault(fault)
       }
   }
@@ -1293,6 +1744,7 @@ fn feed_sse_chunk(
 
 fn inspect_sse_events(
   sse_events: List(String),
+  inbound: Option(Subject(transport.TransportEvent)),
   session_id: Option(String),
   expected_id: Id,
 ) -> Result(Option(ParsedResponse), FaultKind) {
@@ -1309,8 +1761,14 @@ fn inspect_sse_events(
         Ok(jsonrpc.Correlated(jsonrpc.Response(response_id, outcome)))
           if response_id == expected_id
         -> Ok(Some(ParsedResponse(session_id:, value:, outcome:)))
-        Ok(jsonrpc.Correlated(jsonrpc.Notification(..))) ->
-          inspect_sse_events(rest, session_id, expected_id)
+        Ok(jsonrpc.Correlated(jsonrpc.Notification(..)))
+        | Ok(jsonrpc.Correlated(jsonrpc.ServerRequest(..))) -> {
+          case inbound {
+            Some(sub) -> send_frame(sub, value)
+            None -> Nil
+          }
+          inspect_sse_events(rest, inbound, session_id, expected_id)
+        }
         Ok(jsonrpc.UncorrelatedError(error)) ->
           Ok(
             Some(ParsedResponse(
