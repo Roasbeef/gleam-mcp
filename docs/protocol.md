@@ -99,7 +99,7 @@ the request scope before the POST. Retries are disabled. Incremental SSE
 framing bounds event bytes and handles split UTF-8, comments, and multiline
 data. A missing final correlated result leaves execution outcome unknown;
 the library doesn't replay a tool effect after a disconnect or timeout.
-HTTP uses no session ids, event replay, or deprecated GET event channel.
+`client_http` uses no session ids, event replay, or deprecated GET event channel. `streamable_http` adapts both stateless `2026-07-28` HTTP endpoints (`discovery/discover` and mirrored `Mcp-*` / `x-mcp-header` fields) and initialized-session Streamable HTTP endpoints (`2025-06-18`, `2025-03-26`, `2024-11-05` with `Mcp-Session-Id`, `202 Accepted` on `notifications/initialized`, and `DELETE` on shutdown) to `transport.Transport` for dynamic `client` callers, while `oauth` implements OAuth 2.1 PKCE discovery (RFC 9728 / RFC 8414), dynamic registration (RFC 7591), token exchange, refresh rotation, and credential codecs.
 
 The native Gun shim translates maintained library calls and events; Gleam
 owns deadlines, framing, correlation, and custody. Native process identifiers

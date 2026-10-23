@@ -63,6 +63,8 @@ profile dispatch; `server_stdio` owns scoped readers, writers, and handlers.
 
 `http` and `http_headers` admit mirrored metadata before effects; `sse` frames
 bounded byte chunks. `client_http` adopts Gun connections before sending;
+`streamable_http` adapts both `2026-07-28` stateless HTTP and `2025-06-18` /
+`2025-03-26` / `2024-11-05` initialized-session Streamable HTTP (`Mcp-Session-Id` and session `DELETE`) to `transport.Transport`, and `oauth` owns OAuth 2.1 PKCE discovery (RFC 9728 / RFC 8414), dynamic client registration (RFC 7591), token exchange, refresh rotation, and credential codecs;
 `server_http` transfers Mist sockets before admitting a handler scope and
 drains that scope after disconnect. Its closed `Listen` type binds loopback by
 default; `with_listen` admits a literal-IP `Interface` only under `Authenticate`. Custom FFI translates maintained native
