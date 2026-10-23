@@ -81,7 +81,7 @@ exchange never automatically repeats an effect.
 For modern native stdio, use `client.start_modern` with a `PortTransport` and
 pass `client.endpoint(native_client)` to the same typed API. For existing
 initialized clients, `client.start(transport, client.options(version))`
-retains the legacy handshake and raw `list_tools`/`call_tool` interface.
+retains the legacy handshake and raw `list_tools`/`call_tool` interface, and `streamable_http.seam` adapts remote HTTP endpoints (both `2025-06-18` / `2025-03-26` initialized Streamable HTTP with `Mcp-Session-Id` and `2026-07-28` stateless HTTP, plus `oauth` OAuth 2.1 PKCE discovery and refresh) to `transport.Transport`.
 Raw non-text content stays in `protocol.Other(kind, raw)` for the consumer to
 interpret. Applications own the isolation policy for executables they select.
 
