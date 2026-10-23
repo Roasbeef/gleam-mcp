@@ -238,7 +238,7 @@ type WireMode {
 
 type SessionHealth {
   SessionIntact
-  SessionExpiredOnServer
+  SessionExpiredOnServer(expired_sid: String)
 }
 
 type Phase {
@@ -612,17 +612,21 @@ fn next_mode_after_request(
   current: WireMode,
   health: SessionHealth,
 ) -> WireMode {
-  case health {
-    SessionExpiredOnServer -> Negotiating
-    SessionIntact -> current
+  case current, health {
+    InitializedSession(session_id: Some(active_sid), ..),
+      SessionExpiredOnServer(expired_sid:)
+      if active_sid == expired_sid
+    -> Negotiating
+    AwaitingInitialized(session_id: Some(active_sid), ..),
+      SessionExpiredOnServer(expired_sid:)
+      if active_sid == expired_sid
+    -> Negotiating
+    _, _ -> current
   }
 }
 
 fn apply_session_health(state: State, health: SessionHealth) -> State {
-  case health {
-    SessionIntact -> state
-    SessionExpiredOnServer -> State(..state, mode: Negotiating)
-  }
+  State(..state, mode: next_mode_after_request(state.mode, health))
 }
 
 fn handle_send(state: State, line: String) -> sm.Next(Phase, State, Msg) {
@@ -1228,8 +1232,8 @@ fn session_health_for_fault(
   fault: FaultKind,
 ) -> SessionHealth {
   case session_id, fault {
-    Some(_), UnavailableFault("the server answered HTTP 404") ->
-      SessionExpiredOnServer
+    Some(sid), UnavailableFault("the server answered HTTP 404") ->
+      SessionExpiredOnServer(expired_sid: sid)
     _, _ -> SessionIntact
   }
 }
